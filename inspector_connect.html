@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MCP Inspector - Connect to Port 8000</title>
+</head>
+<body>
+    <h1>Connect MCP Inspector to SSE Server</h1>
+    <p>Click the link below to connect the Inspector to your SSE server on port 8000:</p>
+    
+    <a href="http://localhost:6274/?url=http://127.0.0.1:8000/sse&transportType=sse" target="_blank">
+        Connect to SSE Server (port 8000)
+    </a>
+    
+    <h2>Or use the Inspector directly in browser:</h2>
+    <p><strong>Note:</strong> The MCP Inspector should connect automatically when you click the link above.</p>
+    <p>The SSE server is running at <code>http://127.0.0.1:8000/sse</code></p>
+    
+    <h2>Test with curl:</h2>
+    <pre>
+# 1. Connect to SSE endpoint to get session
+curl -N -H "Accept: text/event-stream" http://127.0.0.1:8000/sse
+
+# You'll get a session_id, then use it to send messages to:
+# http://127.0.0.1:8000/messages/?session_id=YOUR_SESSION_ID
+    </pre>
+    
+    <h2>Connection Details:</h2>
+    <ul>
+        <li><strong>Server URL:</strong> http://127.0.0.1:8000/sse</li>
+        <li><strong>Transport:</strong> SSE (Server-Sent Events)</li>
+        <li><strong>Protocol:</strong> MCP (Model Context Protocol)</li>
+    </ul>
+</body>
+</html>

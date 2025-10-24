@@ -4,3 +4,6 @@ openai-agents
 pydantic
 python-dotenv
 agents
+fastapi
+uvicorn[standard]
+requests

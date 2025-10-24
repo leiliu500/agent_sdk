@@ -166,14 +166,14 @@ def llm_json(
     system_prompt: str,
     user_prompt: str,
     json_schema: Dict[str, Any],
-    model: str = "gpt-5.1-mini",  # adjust as needed
+    model: str = "gpt-4o-mini",  # adjust as needed
     temperature: float = 0.1,
 ) -> Dict[str, Any]:
-    """LLM call constrained to JSON schema using Responses API."""
-    resp = client.responses.create(
+    """LLM call constrained to JSON schema using Chat Completions API."""
+    resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
-        input=[
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
@@ -183,11 +183,12 @@ def llm_json(
         },
     )
     try:
-        # Extract the parsed JSON from the response (Responses API returns JSON in output[0].content[0].text)
-        text = resp.output[0].content[0].text  # type: ignore[attr-defined]
+        # Extract the parsed JSON from the response
+        text = resp.choices[0].message.content
         return json.loads(text)
     except Exception as e:  # pragma: no cover
         log.exception("Failed to parse JSON response: %s", e)
+        raise
         raise
 
 
