@@ -1,0 +1,6 @@
+fastmcp
+openai
+openai-agents
+pydantic
+python-dotenv
+agents
