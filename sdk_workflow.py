@@ -6,7 +6,7 @@ Features
 - Router (buy | sell | disclosures | offer | general) with JSON schema
 - Buyer Agent with sub‑agents:
   * Buyer‑Intake (stepwise, no repeat questions; persistent per session)
-  * Search & Match (stub MLS search + payment estimate; replace with real MLSSearchTool)
+    * Search & Match (live MLS web search via Zillow/Redfin/MLSListings + payment estimate)
   * Tour Plan (open‑house schedule optimizer)
   * Disclosure Q&A (file‑based Q&A with sentence‑level citations)
   * Offer Drafter (compliant draft + checklist)
@@ -29,6 +29,7 @@ Notes
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import math
@@ -288,20 +289,136 @@ INTAKE_QUESTIONS = {
 }
 
 
-def intake_step(session: Session, user_message: Optional[str]) -> Dict[str, Any]:
+INTAKE_EXTRACTION_SCHEMA = {
+    "name": "buyer_intake_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "budget": {"type": ["string", "number", "null"]},
+            "locations": {"type": ["string", "null"]},
+            "home_type": {"type": ["string", "null"]},
+            "bedrooms": {"type": ["string", "number", "null"]},
+            "bathrooms": {"type": ["string", "number", "null"]},
+            "financing_status": {"type": ["string", "null"]},
+            "timeline": {"type": ["string", "null"]},
+            "must_haves": {"type": ["string", "null"]},
+            "deal_breakers": {"type": ["string", "null"]},
+            "consents": {"type": ["string", "null"]},
+        },
+        "required": REQUIRED_INTAKE_FIELDS,
+    },
+}
+
+INTAKE_EXTRACTION_SYSTEM = (
+    "You extract real-estate buyer intake details. Identify only the fields that are explicitly "
+    "stated in the user's latest message. Return literal values or short phrases; do not infer or "
+    "fabricate information. If a field is not stated, return null. Normalize numbers using digits "
+    "(e.g., 3 bedrooms) and keep user phrasing for free-text fields."
+)
+
+
+def _normalize_intake_value(field: str, value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if field == "budget":
+            return _format_currency(float(value))
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if field == "budget":
+        price = _coerce_price(text)
+        return _format_currency(price) if price is not None else text
+    if field in {"bedrooms", "bathrooms"}:
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        return match.group(0) if match else text
+    if field == "consents":
+        low = text.lower()
+        if low in {"yes", "y", "yep", "yeah", "sure", "affirmative", "confirmed", "confirm", "i consent", "i agree"}:
+            return "yes"
+        if low in {"no", "n", "nope", "decline", "not yet", "i do not consent"}:
+            return "no"
+        return text
+    return text
+
+
+def _sync_next_field(intake: IntakeState) -> None:
+    for field in REQUIRED_INTAKE_FIELDS:
+        if getattr(intake, field) in (None, ""):
+            intake.next_field = field
+            return
+    intake.next_field = "done"
+
+
+def _extract_intake_fields(message: str) -> Dict[str, Any]:
+    if not message or not message.strip():
+        return {}
+    return llm_json(
+        system_prompt=INTAKE_EXTRACTION_SYSTEM,
+        user_prompt=message,
+        json_schema=INTAKE_EXTRACTION_SCHEMA,
+    )
+
+
+def _ingest_intake_message(
+    session: Session,
+    user_message: Optional[str],
+    slot_hints: Optional[Dict[str, Any]] = None,
+) -> None:
+    # Pre-fill intake fields using structured hints and lightweight extraction.
+    intake = session.intake
+    updated = False
+
+    def _set(field: str, value: Any, *, force: bool = False) -> None:
+        nonlocal updated
+        norm = _normalize_intake_value(field, value)
+        if norm is None:
+            return
+        current = getattr(intake, field)
+        if current in (None, "") or force:
+            if current == norm:
+                return
+            setattr(intake, field, norm)
+            updated = True
+
+    if slot_hints:
+        slot_map = {
+            "budget": slot_hints.get("budget"),
+            "locations": slot_hints.get("areas"),
+            "timeline": slot_hints.get("timing"),
+        }
+        for field, value in slot_map.items():
+            if value not in (None, ""):
+                _set(field, value, force=True)
+
+    if user_message and user_message.strip():
+        try:
+            extracted = _extract_intake_fields(user_message)
+        except Exception as exc:  # pragma: no cover
+            log.warning("Intake extraction failed; falling back to direct assignment: %s", exc)
+            extracted = {}
+        for field in REQUIRED_INTAKE_FIELDS:
+            if field in extracted and extracted[field] not in (None, ""):
+                _set(field, extracted[field], force=True)
+
+    if not updated and user_message and user_message.strip():
+        current = intake.next_field
+        if current in INTAKE_QUESTIONS and getattr(intake, current) in (None, ""):
+            _set(current, user_message.strip(), force=False)
+
+    _sync_next_field(intake)
+
+
+def intake_step(
+    session: Session,
+    user_message: Optional[str],
+    slot_hints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    _ingest_intake_message(session, user_message, slot_hints)
     s = session.intake
-    # Update the previously asked field with user's latest answer when appropriate
-    if user_message and s.next_field in INTAKE_QUESTIONS:
-        current = s.next_field
-        # naive de-dupe: if already filled, don't overwrite (respect no‑repeat rule)
-        if getattr(s, current) is None:
-            setattr(s, current, user_message.strip())
-            # advance pointer
-            i = REQUIRED_INTAKE_FIELDS.index(current)
-            if i + 1 < len(REQUIRED_INTAKE_FIELDS):
-                s.next_field = REQUIRED_INTAKE_FIELDS[i + 1]
-            else:
-                s.next_field = "done"
 
     # Decide what to ask next
     if s.next_field == "done":
@@ -336,7 +453,7 @@ def intake_is_complete(session: Session) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Search & Match Sub‑Agent (stub MLSSearchTool)
+# Search & Match Sub‑Agent (live MLS web search)
 # ──────────────────────────────────────────────────────────────────────────────
 class MatchItem(BaseModel):
     property_id: str
@@ -344,19 +461,72 @@ class MatchItem(BaseModel):
     fit_rationale: str
     estimated_commute: str
     estimated_monthly_payment: str
+    list_price: Optional[float] = None
+    list_price_display: Optional[str] = None
+    beds: Optional[str] = None
+    baths: Optional[str] = None
+    source_url: Optional[str] = None
+    source_name: Optional[str] = None
 
 
-def _mls_search_stub(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Replace with real MLS search. Returns a few mocked properties."""
-    budget = criteria.get("budget", "?")
-    loc = criteria.get("locations", "Preferred Area")
-    base = [
-        {"property_id": "MLS1001", "address": f"123 Maple St, {loc}", "price": 950000, "beds": 3, "baths": 2},
-        {"property_id": "MLS1002", "address": f"456 Oak Ave, {loc}", "price": 880000, "beds": 3, "baths": 2.5},
-        {"property_id": "MLS1003", "address": f"789 Pine Rd, {loc}", "price": 1025000, "beds": 4, "baths": 3},
-        {"property_id": "MLS1004", "address": f"15 Cedar Ct, {loc}", "price": 825000, "beds": 2, "baths": 2},
-    ]
-    return base
+MLS_SEARCH_DOMAINS = ["zillow.com", "redfin.com", "mlslistings.com"]
+
+MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
+    "name": "property_listing_results",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "search_queries": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "domain": {"type": "string"},
+                        "query": {"type": "string"},
+                        "result_summary": {"type": "string"},
+                    },
+                    "required": ["domain", "query"],
+                },
+            },
+            "listings": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 7,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "property_id": {"type": "string"},
+                        "address": {"type": "string"},
+                        "list_price": {"type": ["number", "string"]},
+                        "beds": {"type": ["number", "string", "null"]},
+                        "baths": {"type": ["number", "string", "null"]},
+                        "source_url": {"type": "string"},
+                        "source_name": {"type": "string"},
+                        "fit_reasoning": {"type": "string"},
+                        "commute_notes": {"type": ["string", "null"]},
+                        "notes": {"type": ["string", "null"]},
+                    },
+                    "required": ["address", "list_price", "source_url", "source_name", "fit_reasoning"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["search_queries", "listings"],
+    },
+}
+
+MLS_WEB_SEARCH_SYSTEM_PROMPT = (
+    "You are a licensed real-estate research assistant. Use the web_search tool to research "
+    "only Zillow, Redfin, and MLSListings webpages. For every query you send, include a `site:` "
+    "filter targeting one of these domains. Extract on-market residential properties that match the "
+    "buyer criteria, and capture verifiable facts only. Return structured JSON that conforms exactly to "
+    "the provided schema."
+)
 
 
 def _estimate_monthly_payment(price: float, down_pct: float = 0.2, rate: float = 0.065, years: int = 30) -> float:
@@ -368,27 +538,152 @@ def _estimate_monthly_payment(price: float, down_pct: float = 0.2, rate: float =
     return loan * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
 
+def _format_currency(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"${value:,.0f}"
+
+
+def _coerce_price(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r"[^0-9.]", "", value)
+        if cleaned:
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_domain(url: Optional[str]) -> Optional[str]:
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).netloc or None
+    except Exception:  # pragma: no cover
+        return None
+
+
+def _derive_property_id(listing: Dict[str, Any]) -> str:
+    existing = listing.get("property_id")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    url = listing.get("source_url")
+    domain = _extract_domain(url)
+    if url:
+        slug = url.rstrip("/").split("/")[-1]
+        slug = slug[:48] if slug else "listing"
+    else:
+        slug = "listing"
+    return f"{(domain or 'property')}-{slug}-{uuid.uuid4().hex[:6]}"
+
+
+def _response_output_text(resp: Any) -> str:
+    text = getattr(resp, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", None) == "output_text":
+                candidate = getattr(content, "text", "")
+                if candidate:
+                    return candidate
+    raise ValueError("No textual output in response")
+
+
+def _schema_to_text_config(schema_def: Dict[str, Any]) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {
+        "type": schema_def.get("type", "json_schema"),
+        "name": schema_def["name"],
+        "schema": schema_def["schema"],
+    }
+    if "description" in schema_def:
+        cfg["description"] = schema_def["description"]
+    if "strict" in schema_def:
+        cfg["strict"] = schema_def["strict"]
+    return {"format": cfg}
+
+
+def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
+    criteria_lines = [
+        f"Budget: {criteria.get('budget') or 'unspecified'}",
+        f"Target locations: {criteria.get('locations') or 'unspecified'}",
+        f"Home type: {criteria.get('home_type') or 'unspecified'}",
+        f"Bedrooms: {criteria.get('bedrooms') or 'unspecified'}",
+        f"Bathrooms: {criteria.get('bathrooms') or 'unspecified'}",
+        f"Timeline: {criteria.get('timeline') or 'unspecified'}",
+        f"Must haves: {criteria.get('must_haves') or 'unspecified'}",
+        f"Deal breakers: {criteria.get('deal_breakers') or 'unspecified'}",
+    ]
+    user_prompt = (
+        "Search each site `" +
+        "`, `".join(MLS_SEARCH_DOMAINS) +
+        "` using the web_search tool with explicit `site:` filters. Focus on residential listings that "
+        "best match the buyer intake. For every listing include the verified price, headline address, "
+        "beds/baths, and direct URL. If information is missing or cannot be verified, omit the listing.\n\n"
+        "Buyer intake summary:\n- " + "\n- ".join(criteria_lines)
+    )
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {"role": "system", "content": MLS_WEB_SEARCH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        tools=[{"type": "web_search"}],
+        temperature=0.2,
+        text=_schema_to_text_config(MLS_WEB_SEARCH_SCHEMA),
+    )
+    parsed = json.loads(_response_output_text(resp))
+    return parsed
+
+
 def search_and_match(session: Session) -> List[MatchItem]:
     s = session.intake
     criteria = {k: getattr(s, k) for k in REQUIRED_INTAKE_FIELDS}
-    raw = _mls_search_stub(criteria)
-    out: List[MatchItem] = []
-    for p in raw[:7]:
-        pay = _estimate_monthly_payment(p["price"]) + 650  # rough taxes+ins HOA pad
-        rationale = (
-            f"Within or near budget; matches bedrooms/bathrooms where possible; in {s.locations or 'target area'}."
+    listings: List[Dict[str, Any]] = []
+    try:
+        live_payload = _mls_search_live(criteria)
+        listings = live_payload.get("listings", []) if isinstance(live_payload, dict) else []
+    except Exception as exc:  # pragma: no cover - network/tool failure fallback
+        log.exception("MLS web search call failed", exc_info=exc)
+        raise RuntimeError("MLS web search failed; please retry later") from exc
+
+    def _listing_to_match(listing: Dict[str, Any]) -> MatchItem:
+        price_val = _coerce_price(listing.get("list_price"))
+        monthly_val = (_estimate_monthly_payment(price_val) + 650) if price_val else None
+        fit = listing.get("fit_reasoning") or listing.get("notes") or (
+            f"Matches stated preferences for {criteria.get('locations') or 'target area'}."
         )
-        commute = "25–35 min drive to downtown; 10–15 min to nearest school district (est.)."
-        out.append(
-            MatchItem(
-                property_id=p["property_id"],
-                address=p["address"],
-                fit_rationale=rationale,
-                estimated_commute=commute,
-                estimated_monthly_payment=f"${pay:,.0f}",
-            )
+        commute = listing.get("commute_notes") or (
+            f"Confirm commute from {listing.get('address', 'property address')} to {criteria.get('locations') or 'target area'}."
         )
-    return out
+        beds_val = listing.get("beds")
+        baths_val = listing.get("baths")
+        source_url = listing.get("source_url")
+        source_name = listing.get("source_name") or (_extract_domain(source_url) or "web_search")
+        return MatchItem(
+            property_id=_derive_property_id(listing),
+            address=listing.get("address", "Unknown address"),
+            fit_rationale=fit,
+            estimated_commute=commute,
+            estimated_monthly_payment=_format_currency(monthly_val),
+            list_price=price_val,
+            list_price_display=_format_currency(price_val) if price_val is not None else None,
+            beds=str(beds_val) if beds_val not in (None, "") else None,
+            baths=str(baths_val) if baths_val not in (None, "") else None,
+            source_url=source_url,
+            source_name=source_name,
+        )
+
+    matches = [_listing_to_match(item) for item in listings[:7]]
+    return matches
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -645,7 +940,7 @@ def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[st
     if intent == "buy":
         next_node = "buyer_intake_step"
         # Auto-execute buyer intake with the user's message
-        intake_result = intake_step(session, user_message)
+        intake_result = intake_step(session, user_message, routed.get("slots_obj"))
         next_step_result = {
             "step": "buyer_intake_step",
             "result": intake_result,
@@ -731,7 +1026,7 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
 
 @mcp.tool
 def search_and_match_tool(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Run MLS search (stub) and generate 3–7 recommendations with rationale, commute, and payment estimates."""
+    """Run live MLS web search and generate 3–7 recommendations with rationale, commute, and payment estimates."""
     sid, session = _get_session(session_id)
     if not intake_is_complete(session):
         return [{"error": "Intake not complete. Call buyer_intake_step until summary confirmed."}]
