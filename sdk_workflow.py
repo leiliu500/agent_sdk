@@ -618,7 +618,7 @@ mcp = FastMCP("RealEstate Workflow MCP")
 
 @mcp.tool
 def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-    """End-to-end entry point. Applies Guardrails, then routes request. Returns the router result and a suggested next_node."""
+    """End-to-end entry point. Applies Guardrails, then routes request, and automatically executes the appropriate next step."""
     sid, session = _get_session(session_id)
 
     # 1) Guardrails
@@ -638,18 +638,43 @@ def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[st
     # keep minimal history
     session.history.append({"user": user_message, "agent": f"intent={intent}"})
 
-    # 3) If/Else → Buyer Agent when buy
+    # 3) If/Else → Buyer Agent when buy - AUTO-EXECUTE next step
     next_node = None
+    next_step_result = None
+    
     if intent == "buy":
         next_node = "buyer_intake_step"
+        # Auto-execute buyer intake with the user's message
+        intake_result = intake_step(session, user_message)
+        next_step_result = {
+            "step": "buyer_intake_step",
+            "result": intake_result,
+            "intake_complete": intake_is_complete(session)
+        }
     elif intent == "disclosures":
         next_node = "disclosure_qa"
+        next_step_result = {
+            "step": "disclosure_qa",
+            "message": "Please provide the disclosure documents and your specific question."
+        }
     elif intent == "offer":
         next_node = "offer_drafter"
+        next_step_result = {
+            "step": "offer_drafter",
+            "message": "Please provide property details to draft an offer."
+        }
     elif intent == "sell":
-        next_node = "general_sell_agent"  # placeholder for future
+        next_node = "general_sell_agent"
+        next_step_result = {
+            "step": "general_sell_agent",
+            "message": "Selling agent workflow - please provide property details."
+        }
     else:
         next_node = "general"
+        next_step_result = {
+            "step": "general",
+            "message": "I can help you with buying, selling, or property disclosures. How can I assist you?"
+        }
 
     return {
         "session_id": sid,
@@ -657,6 +682,7 @@ def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[st
         "router": routed,
         "slots_obj": routed.get("slots_obj", {}),
         "next_node": next_node,
+        "next_step_result": next_step_result,
     }
 
 
@@ -667,9 +693,40 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
     result = intake_step(session, user_message)
     done = intake_is_complete(session)
     next_node = None
-    if done:
-        next_node = "search_and_match"
-    return {"session_id": sid, "result": result, "intake_complete": done, "next_node": next_node}
+    next_step_result = None
+    
+    # If intake is complete and user confirmed, automatically execute search_and_match
+    if done and result.get("status") == "summary":
+        # Check if user confirmed (looking for affirmative response)
+        if user_message and user_message.strip().lower() in ["yes", "y", "confirmed", "correct", "confirm"]:
+            next_node = "search_and_match"
+            # Auto-execute search and match
+            try:
+                matches = search_and_match(session)
+                next_step_result = {
+                    "step": "search_and_match",
+                    "matches": [m.model_dump() for m in matches],
+                    "count": len(matches)
+                }
+                result["auto_executed_next_step"] = True
+            except Exception as e:
+                log.exception("Failed to auto-execute search_and_match: %s", e)
+                next_step_result = {
+                    "step": "search_and_match",
+                    "error": str(e),
+                    "message": "Please call search_and_match_tool manually"
+                }
+        else:
+            # Still showing summary, waiting for confirmation
+            next_node = "search_and_match"
+    
+    return {
+        "session_id": sid, 
+        "result": result, 
+        "intake_complete": done, 
+        "next_node": next_node,
+        "next_step_result": next_step_result
+    }
 
 
 @mcp.tool
