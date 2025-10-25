@@ -41,6 +41,17 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 
+import prompts
+from schemas import (
+    get_intake_extraction_schema,
+    get_negotiation_coach_schema,
+    get_offer_drafter_schema,
+    get_required_intake_fields,
+    get_router_json_schema,
+    get_mls_web_search_schema,
+    get_tour_plan_extraction_schema,
+)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -124,38 +135,6 @@ def _get_session(session_id: Optional[str]) -> Tuple[str, Session]:
 # ──────────────────────────────────────────────────────────────────────────────
 # JSON Schemas
 # ──────────────────────────────────────────────────────────────────────────────
-ROUTER_JSON_SCHEMA: Dict[str, Any] = {
-    "name": "response_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "intent": {"type": "string", "enum": ["buy", "sell", "disclosures", "offer", "general"]},
-            "confidence": {"type": "number"},
-            # NOTE: matches user's schema (string). We also return a parsed copy as slots_obj
-            "slots": {"type": "string"},
-        },
-        "required": ["intent", "confidence", "slots"],
-        "additionalProperties": False,
-        "title": "response_schema",
-    },
-    "strict": True,
-}
-
-# Buyer‑Intake completion gate
-REQUIRED_INTAKE_FIELDS = [
-    "budget",
-    "locations",
-    "home_type",
-    "bedrooms",
-    "bathrooms",
-    "financing_status",
-    "timeline",
-    "must_haves",
-    "deal_breakers",
-    "consents",
-]
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # LLM Helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -232,17 +211,6 @@ def jailbreak_check(user_message: str) -> GuardrailResult:
 # ──────────────────────────────────────────────────────────────────────────────
 # Router Node
 # ──────────────────────────────────────────────────────────────────────────────
-ROUTER_SYSTEM_PROMPT = (
-    "You are an orchestration agent for a real-estate brokerage. Your task is to classify "
-    "the user's intent strictly into one of these categories: {buy, sell, disclosures, offer}. "
-    "Next, extract all relevant slots from the user's message, including budget, areas (geographical/locations of interest), "
-    "timing, property_ref, listing_id, and contact information (email/phone) if it is explicitly provided. Do not infer any information related to Fair Housing protected categories or make assumptions not based on user statements.\n\n"
-    "Your response should be a single JSON object containing: intent, confidence [0..1], and slots.\n"
-    "If the user's request is ambiguous or falls outside the provided intent categories, use 'general'.\n"
-    "Always reason step-by-step internally and only output the final JSON."
-)
-
-
 def router_route(user_message: str, session: Session) -> Dict[str, Any]:
     # include light chat history for consistency
     history_snippets = [
@@ -257,7 +225,11 @@ def router_route(user_message: str, session: Session) -> Dict[str, Any]:
         "Return only the JSON."
     )
 
-    out = llm_json(system_prompt=ROUTER_SYSTEM_PROMPT, user_prompt=user_prompt, json_schema=ROUTER_JSON_SCHEMA)
+    out = llm_json(
+        system_prompt=prompts.router_system_prompt(),
+        user_prompt=user_prompt,
+        json_schema=get_router_json_schema(),
+    )
 
     # Safely parse slots string → dict
     slots_obj: Dict[str, Any] = {}
@@ -290,36 +262,6 @@ INTAKE_QUESTIONS = {
 }
 
 
-INTAKE_EXTRACTION_SCHEMA = {
-    "name": "buyer_intake_extraction",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "budget": {"type": ["string", "number", "null"]},
-            "locations": {"type": ["string", "null"]},
-            "home_type": {"type": ["string", "null"]},
-            "bedrooms": {"type": ["string", "number", "null"]},
-            "bathrooms": {"type": ["string", "number", "null"]},
-            "financing_status": {"type": ["string", "null"]},
-            "timeline": {"type": ["string", "null"]},
-            "must_haves": {"type": ["string", "null"]},
-            "deal_breakers": {"type": ["string", "null"]},
-            "consents": {"type": ["string", "null"]},
-        },
-        "required": REQUIRED_INTAKE_FIELDS,
-    },
-}
-
-INTAKE_EXTRACTION_SYSTEM = (
-    "You extract real-estate buyer intake details. Identify only the fields that are explicitly "
-    "stated in the user's latest message. Return literal values or short phrases; do not infer or "
-    "fabricate information. If a field is not stated, return null. Normalize numbers using digits "
-    "(e.g., 3 bedrooms) and keep user phrasing for free-text fields."
-)
-
-
 def _normalize_intake_value(field: str, value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -347,7 +289,8 @@ def _normalize_intake_value(field: str, value: Any) -> Optional[str]:
 
 
 def _sync_next_field(intake: IntakeState) -> None:
-    for field in REQUIRED_INTAKE_FIELDS:
+    required_fields = get_required_intake_fields()
+    for field in required_fields:
         if getattr(intake, field) in (None, ""):
             intake.next_field = field
             return
@@ -358,9 +301,9 @@ def _extract_intake_fields(message: str) -> Dict[str, Any]:
     if not message or not message.strip():
         return {}
     return llm_json(
-        system_prompt=INTAKE_EXTRACTION_SYSTEM,
+        system_prompt=prompts.intake_extraction_system_prompt(),
         user_prompt=message,
-        json_schema=INTAKE_EXTRACTION_SCHEMA,
+        json_schema=get_intake_extraction_schema(),
     )
 
 
@@ -372,6 +315,7 @@ def _ingest_intake_message(
     # Pre-fill intake fields using structured hints and lightweight extraction.
     intake = session.intake
     updated = False
+    required_fields = get_required_intake_fields()
 
     def _set(field: str, value: Any, *, force: bool = False) -> None:
         nonlocal updated
@@ -401,7 +345,7 @@ def _ingest_intake_message(
         except Exception as exc:  # pragma: no cover
             log.warning("Intake extraction failed; falling back to direct assignment: %s", exc)
             extracted = {}
-        for field in REQUIRED_INTAKE_FIELDS:
+        for field in required_fields:
             if field in extracted and extracted[field] not in (None, ""):
                 _set(field, extracted[field], force=True)
 
@@ -420,10 +364,11 @@ def intake_step(
 ) -> Dict[str, Any]:
     _ingest_intake_message(session, user_message, slot_hints)
     s = session.intake
+    required_fields = get_required_intake_fields()
 
     # Decide what to ask next
     if s.next_field == "done":
-        summary = {k: getattr(s, k) for k in REQUIRED_INTAKE_FIELDS}
+        summary = {k: getattr(s, k) for k in required_fields}
         return {
             "status": "summary",
             "message": (
@@ -435,7 +380,7 @@ def intake_step(
     next_q = INTAKE_QUESTIONS[s.next_field]
     # reference previously filled info as context (no repetition)
     ctx_bits = []
-    for k in REQUIRED_INTAKE_FIELDS:
+    for k in required_fields:
         v = getattr(s, k)
         if v and k != s.next_field:
             ctx_bits.append(f"{k.replace('_', ' ').title()}: {v}")
@@ -450,7 +395,8 @@ def intake_step(
 
 def intake_is_complete(session: Session) -> bool:
     s = session.intake
-    return all(getattr(s, k) not in (None, "") for k in REQUIRED_INTAKE_FIELDS)
+    required_fields = get_required_intake_fields()
+    return all(getattr(s, k) not in (None, "") for k in required_fields)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -472,88 +418,6 @@ class MatchItem(BaseModel):
 
 
 MLS_SEARCH_DOMAINS = ["zillow.com", "redfin.com", "mlslistings.com"]
-
-MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
-    "name": "property_listing_results",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "search_queries": {
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 6,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "domain": {"type": "string"},
-                        "query": {"type": "string"},
-                        "result_summary": {"type": "string"},
-                    },
-                    "required": ["domain", "query", "result_summary"],
-                },
-            },
-            "listings": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 7,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "property_id": {"type": ["string", "null"]},
-                        "address": {"type": "string"},
-                        "list_price": {"type": ["number", "string"]},
-                        "beds": {"type": ["number", "string", "null"]},
-                        "baths": {"type": ["number", "string", "null"]},
-                        "source_url": {"type": "string"},
-                        "source_name": {"type": "string"},
-                        "fit_reasoning": {"type": "string"},
-                        "commute_notes": {"type": ["string", "null"]},
-                        "notes": {"type": ["string", "null"]},
-                        "open_house_slots": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "start": {"type": "string"},
-                                    "end": {"type": "string"},
-                                },
-                                "required": ["start", "end"],
-                            },
-                        },
-                    },
-                    "required": [
-                        "property_id",
-                        "address",
-                        "list_price",
-                        "beds",
-                        "baths",
-                        "source_url",
-                        "source_name",
-                        "fit_reasoning",
-                        "commute_notes",
-                        "notes",
-                        "open_house_slots",
-                    ],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["search_queries", "listings"],
-    },
-}
-
-MLS_WEB_SEARCH_SYSTEM_PROMPT = (
-    "You are a licensed real-estate research assistant. Use the web_search tool to research "
-    "only Zillow, Redfin, and MLSListings webpages. For every query you send, include a `site:` "
-    "filter targeting one of these domains. Extract on-market residential properties that match the "
-    "buyer criteria, capture open house start and end times in HH:MM 24-hour format when available, and "
-    "record verifiable facts only. Return structured JSON that conforms exactly to the provided schema."
-)
-
 
 def _estimate_monthly_payment(price: float, down_pct: float = 0.2, rate: float = 0.065, years: int = 30) -> float:
     loan = price * (1 - down_pct)
@@ -688,12 +552,12 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
     resp = client.responses.create(
         model="gpt-4.1-mini",
         input=[
-            {"role": "system", "content": MLS_WEB_SEARCH_SYSTEM_PROMPT},
+            {"role": "system", "content": prompts.mls_web_search_system_prompt()},
             {"role": "user", "content": user_prompt},
         ],
         tools=[{"type": "web_search"}],
         temperature=0.2,
-        text=_schema_to_text_config(MLS_WEB_SEARCH_SCHEMA),
+        text=_schema_to_text_config(get_mls_web_search_schema()),
     )
     raw_text = _response_output_text(resp)
     try:
@@ -708,7 +572,8 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
 
 def search_and_match(session: Session) -> List[MatchItem]:
     s = session.intake
-    criteria = {k: getattr(s, k) for k in REQUIRED_INTAKE_FIELDS}
+    required_fields = get_required_intake_fields()
+    criteria = {k: getattr(s, k) for k in required_fields}
     listings: List[Dict[str, Any]] = []
     try:
         live_payload = _mls_search_live(criteria)
@@ -773,61 +638,6 @@ class TourInput(BaseModel):
     )
 
 
-TOUR_PLAN_EXTRACTION_SCHEMA = {
-    "name": "tour_plan_extraction",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "open_houses": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "property_id": {"type": ["string", "null"]},
-                        "address": {"type": "string"},
-                        "slots": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "start": {"type": "string"},
-                                    "end": {"type": "string"},
-                                },
-                                "required": ["start", "end"],
-                            },
-                        },
-                    },
-                    "required": ["address", "slots"],
-                },
-            },
-            "preferred_windows": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "start": {"type": "string"},
-                        "end": {"type": "string"},
-                    },
-                    "required": ["start", "end"],
-                },
-            },
-        },
-        "required": ["open_houses", "preferred_windows"],
-    },
-}
-
-TOUR_PLAN_EXTRACTION_SYSTEM = (
-    "You extract open house details and preferred visit windows from the latest message. "
-    "Return only what is explicitly stated. Normalize time to HH:MM 24-hour format where possible."
-)
-
-
 def _time_to_minutes(t: str) -> int:
     h, m = t.split(":")
     return int(h) * 60 + int(m)
@@ -839,9 +649,9 @@ def _minutes_to_time(x: int) -> str:
 
 def _extract_tour_plan_inputs(message: str) -> Dict[str, Any]:
     return llm_json(
-        system_prompt=TOUR_PLAN_EXTRACTION_SYSTEM,
+        system_prompt=prompts.tour_plan_extraction_system_prompt(),
         user_prompt=message,
-        json_schema=TOUR_PLAN_EXTRACTION_SCHEMA,
+        json_schema=get_tour_plan_extraction_schema(),
     )
 
 
@@ -1104,57 +914,6 @@ def disclosure_qa(files: List[QAFile], question: str) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Offer Drafter & Negotiation Coach — use LLM with strict JSON output
 # ──────────────────────────────────────────────────────────────────────────────
-OFFER_DRAFTER_SCHEMA = {
-    "name": "offer_draft_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "reasoning_steps": {"type": "array", "items": {"type": "string"}},
-            "offer_draft": {"type": "object"},
-            "alternate_scenarios": {"type": "array"},
-            "handoff": {"type": "object"},
-        },
-        "required": ["reasoning_steps", "offer_draft", "alternate_scenarios", "handoff"],
-        "additionalProperties": True,
-    },
-}
-
-NEGOTIATION_COACH_SCHEMA = {
-    "name": "negotiation_coach_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "reasoning_steps": {"type": "array", "items": {"type": "string"}},
-            "market_context": {"type": "object"},
-            "offer_draft": {"type": "object"},
-            "alternate_scenarios": {"type": "array"},
-            "scenario_talking_points": {"type": "array"},
-            "handoff": {"type": "object"},
-        },
-        "required": [
-            "reasoning_steps",
-            "market_context",
-            "offer_draft",
-            "alternate_scenarios",
-            "scenario_talking_points",
-            "handoff",
-        ],
-        "additionalProperties": True,
-    },
-}
-
-OFFER_DRAFTER_SYSTEM = (
-    "You are an expert real estate Offer Drafter sub-agent. Generate compliant, ready-to-sign drafts "
-    "following the procedural checklist, compliance guardrails, auto-filled terms, alternate scenarios, and e-sign handoff. "
-    "Always reason step-by-step before conclusions. Use the exact JSON structure described in the user's spec."
-)
-
-NEGOTIATION_COACH_SYSTEM = (
-    "You are an expert real estate Offer Drafter and Negotiation Coach. Incorporate market context—comps, DOM, and seasonality—into the draft and guidance. "
-    "Provide stepwise reasoning before any conclusions and return JSON exactly per the user's spec."
-)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # MCP Server and Tools
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1390,13 +1149,21 @@ def disclosure_qa_tool(question: str, files: List[Dict[str, str]]) -> Dict[str, 
 @mcp.tool
 def offer_drafter_tool(prompt_context: str) -> Dict[str, Any]:
     """LLM-backed Offer Drafter. Provide the user/context details in prompt_context; returns structured JSON per spec."""
-    return llm_json(system_prompt=OFFER_DRAFTER_SYSTEM, user_prompt=prompt_context, json_schema=OFFER_DRAFTER_SCHEMA)
+    return llm_json(
+        system_prompt=prompts.offer_drafter_system_prompt(),
+        user_prompt=prompt_context,
+        json_schema=get_offer_drafter_schema(),
+    )
 
 
 @mcp.tool
 def negotiation_coach_tool(prompt_context: str) -> Dict[str, Any]:
     """LLM-backed Negotiation Coach. Include comps, DOM, seasonality in prompt_context; returns structured JSON per spec."""
-    return llm_json(system_prompt=NEGOTIATION_COACH_SYSTEM, user_prompt=prompt_context, json_schema=NEGOTIATION_COACH_SCHEMA)
+    return llm_json(
+        system_prompt=prompts.negotiation_coach_system_prompt(),
+        user_prompt=prompt_context,
+        json_schema=get_negotiation_coach_schema(),
+    )
 
 
 # Convenience: simple health check and session reset
