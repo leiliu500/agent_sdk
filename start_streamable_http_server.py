@@ -14,8 +14,18 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# Import tool functions directly
-import real_estate_workflow
+# Import tool functions directly from the workflows package
+from workflows import (
+    buyer_intake_step,
+    disclosure_qa_tool,
+    health,
+    negotiation_coach_tool,
+    offer_drafter_tool,
+    reset_session,
+    run_workflow,
+    search_and_match_tool,
+    tour_plan_tool,
+)
 
 app = FastAPI(title="Real Estate MCP Streamable HTTP Server")
 
@@ -47,15 +57,15 @@ last_session_by_ip: Dict[str, str] = {}  # Map IP address to last used session
 
 # Map of tool names to functions
 TOOL_FUNCTIONS = {
-    "run_workflow": real_estate_workflow.run_workflow,
-    "buyer_intake_step": real_estate_workflow.buyer_intake_step,
-    "search_and_match_tool": real_estate_workflow.search_and_match_tool,
-    "tour_plan_tool": real_estate_workflow.tour_plan_tool,
-    "disclosure_qa_tool": real_estate_workflow.disclosure_qa_tool,
-    "offer_drafter_tool": real_estate_workflow.offer_drafter_tool,
-    "negotiation_coach_tool": real_estate_workflow.negotiation_coach_tool,
-    "health": real_estate_workflow.health,
-    "reset_session": real_estate_workflow.reset_session,
+    "run_workflow": run_workflow,
+    "buyer_intake_step": buyer_intake_step,
+    "search_and_match_tool": search_and_match_tool,
+    "tour_plan_tool": tour_plan_tool,
+    "disclosure_qa_tool": disclosure_qa_tool,
+    "offer_drafter_tool": offer_drafter_tool,
+    "negotiation_coach_tool": negotiation_coach_tool,
+    "health": health,
+    "reset_session": reset_session,
 }
 
 # Manual schemas for tools (since FastMCP wrapping may not expose schemas properly)
