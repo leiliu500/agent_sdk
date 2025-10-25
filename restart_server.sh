@@ -8,6 +8,6 @@ lsof -ti:8000 | xargs kill -9 2>/dev/null || true
 sleep 1
 
 # Start the server
-echo "Starting SSE server..."
-/Users/leiliu/projects/agent_sdk/.venv/bin/python start_sse_server.py
+echo "Starting Streamable HTTP server..."
+/Users/leiliu/projects/agent_sdk/.venv/bin/python start_streamable_http_server.py
 
