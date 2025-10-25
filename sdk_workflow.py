@@ -490,7 +490,7 @@ MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
                         "query": {"type": "string"},
                         "result_summary": {"type": "string"},
                     },
-                    "required": ["domain", "query"],
+                    "required": ["domain", "query", "result_summary"],
                 },
             },
             "listings": {
@@ -500,7 +500,7 @@ MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "property_id": {"type": "string"},
+                        "property_id": {"type": ["string", "null"]},
                         "address": {"type": "string"},
                         "list_price": {"type": ["number", "string"]},
                         "beds": {"type": ["number", "string", "null"]},
@@ -511,7 +511,18 @@ MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
                         "commute_notes": {"type": ["string", "null"]},
                         "notes": {"type": ["string", "null"]},
                     },
-                    "required": ["address", "list_price", "source_url", "source_name", "fit_reasoning"],
+                    "required": [
+                        "property_id",
+                        "address",
+                        "list_price",
+                        "beds",
+                        "baths",
+                        "source_url",
+                        "source_name",
+                        "fit_reasoning",
+                        "commute_notes",
+                        "notes",
+                    ],
                     "additionalProperties": False,
                 },
             },
