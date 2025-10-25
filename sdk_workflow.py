@@ -160,6 +160,7 @@ REQUIRED_INTAKE_FIELDS = [
 # LLM Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 client = OpenAI()
+JSON_DECODER = json.JSONDecoder()
 
 
 def llm_json(
@@ -461,6 +462,7 @@ class MatchItem(BaseModel):
     fit_rationale: str
     estimated_commute: str
     estimated_monthly_payment: str
+    open_house_slots: List[Dict[str, str]] = Field(default_factory=list)
     list_price: Optional[float] = None
     list_price_display: Optional[str] = None
     beds: Optional[str] = None
@@ -510,6 +512,18 @@ MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
                         "fit_reasoning": {"type": "string"},
                         "commute_notes": {"type": ["string", "null"]},
                         "notes": {"type": ["string", "null"]},
+                        "open_house_slots": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"},
+                                },
+                                "required": ["start", "end"],
+                            },
+                        },
                     },
                     "required": [
                         "property_id",
@@ -522,6 +536,7 @@ MLS_WEB_SEARCH_SCHEMA: Dict[str, Any] = {
                         "fit_reasoning",
                         "commute_notes",
                         "notes",
+                        "open_house_slots",
                     ],
                     "additionalProperties": False,
                 },
@@ -535,8 +550,8 @@ MLS_WEB_SEARCH_SYSTEM_PROMPT = (
     "You are a licensed real-estate research assistant. Use the web_search tool to research "
     "only Zillow, Redfin, and MLSListings webpages. For every query you send, include a `site:` "
     "filter targeting one of these domains. Extract on-market residential properties that match the "
-    "buyer criteria, and capture verifiable facts only. Return structured JSON that conforms exactly to "
-    "the provided schema."
+    "buyer criteria, capture open house start and end times in HH:MM 24-hour format when available, and "
+    "record verifiable facts only. Return structured JSON that conforms exactly to the provided schema."
 )
 
 
@@ -621,6 +636,34 @@ def _schema_to_text_config(schema_def: Dict[str, Any]) -> Dict[str, Any]:
     return {"format": cfg}
 
 
+def _parse_json_from_text(text: str) -> Any:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("Empty response payload")
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*", "", cleaned).strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+
+    try:
+        obj, _ = JSON_DECODER.raw_decode(cleaned)
+        return obj
+    except json.JSONDecodeError:
+        pass
+
+    for idx, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            obj, _ = JSON_DECODER.raw_decode(cleaned, idx)
+            return obj
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Unable to parse JSON payload from response")
+
+
 def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
     criteria_lines = [
         f"Budget: {criteria.get('budget') or 'unspecified'}",
@@ -637,7 +680,8 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
         "`, `".join(MLS_SEARCH_DOMAINS) +
         "` using the web_search tool with explicit `site:` filters. Focus on residential listings that "
         "best match the buyer intake. For every listing include the verified price, headline address, "
-        "beds/baths, and direct URL. If information is missing or cannot be verified, omit the listing.\n\n"
+        "beds/baths, direct URL, and any published open house time ranges formatted as HH:MM 24-hour "
+        "open_house_slots. If information is missing or cannot be verified, omit the listing.\n\n"
         "Buyer intake summary:\n- " + "\n- ".join(criteria_lines)
     )
 
@@ -651,7 +695,14 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
         temperature=0.2,
         text=_schema_to_text_config(MLS_WEB_SEARCH_SCHEMA),
     )
-    parsed = json.loads(_response_output_text(resp))
+    raw_text = _response_output_text(resp)
+    try:
+        parsed = _parse_json_from_text(raw_text)
+    except Exception as exc:
+        log.debug("Raw MLS search response text: %s", raw_text)
+        raise ValueError("Failed to parse MLS search JSON payload") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("MLS search response payload is not an object")
     return parsed
 
 
@@ -675,6 +726,18 @@ def search_and_match(session: Session) -> List[MatchItem]:
         commute = listing.get("commute_notes") or (
             f"Confirm commute from {listing.get('address', 'property address')} to {criteria.get('locations') or 'target area'}."
         )
+        slots_clean: List[Dict[str, str]] = []
+        raw_slots = listing.get("open_house_slots") or []
+        if isinstance(raw_slots, dict):
+            raw_slots = [raw_slots]
+        if isinstance(raw_slots, list):
+            for slot in raw_slots:
+                if not isinstance(slot, dict):
+                    continue
+                start = _normalize_time_string(slot.get("start"))
+                end = _normalize_time_string(slot.get("end"))
+                if start and end:
+                    slots_clean.append({"start": start, "end": end})
         beds_val = listing.get("beds")
         baths_val = listing.get("baths")
         source_url = listing.get("source_url")
@@ -685,6 +748,7 @@ def search_and_match(session: Session) -> List[MatchItem]:
             fit_rationale=fit,
             estimated_commute=commute,
             estimated_monthly_payment=_format_currency(monthly_val),
+            open_house_slots=slots_clean,
             list_price=price_val,
             list_price_display=_format_currency(price_val) if price_val is not None else None,
             beds=str(beds_val) if beds_val not in (None, "") else None,
@@ -709,6 +773,61 @@ class TourInput(BaseModel):
     )
 
 
+TOUR_PLAN_EXTRACTION_SCHEMA = {
+    "name": "tour_plan_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "open_houses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "property_id": {"type": ["string", "null"]},
+                        "address": {"type": "string"},
+                        "slots": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"},
+                                },
+                                "required": ["start", "end"],
+                            },
+                        },
+                    },
+                    "required": ["address", "slots"],
+                },
+            },
+            "preferred_windows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "start": {"type": "string"},
+                        "end": {"type": "string"},
+                    },
+                    "required": ["start", "end"],
+                },
+            },
+        },
+        "required": ["open_houses", "preferred_windows"],
+    },
+}
+
+TOUR_PLAN_EXTRACTION_SYSTEM = (
+    "You extract open house details and preferred visit windows from the latest message. "
+    "Return only what is explicitly stated. Normalize time to HH:MM 24-hour format where possible."
+)
+
+
 def _time_to_minutes(t: str) -> int:
     h, m = t.split(":")
     return int(h) * 60 + int(m)
@@ -716,6 +835,126 @@ def _time_to_minutes(t: str) -> int:
 
 def _minutes_to_time(x: int) -> str:
     return f"{x // 60:02d}:{x % 60:02d}"
+
+
+def _extract_tour_plan_inputs(message: str) -> Dict[str, Any]:
+    return llm_json(
+        system_prompt=TOUR_PLAN_EXTRACTION_SYSTEM,
+        user_prompt=message,
+        json_schema=TOUR_PLAN_EXTRACTION_SCHEMA,
+    )
+
+
+def _normalize_time_string(raw: Any) -> Optional[str]:
+    """Normalize flexible time strings (10am, 1:30 PM, 1330) → HH:MM 24h."""
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    text = text.replace(".", ":")
+    text = re.sub(r"\s+", "", text)
+
+    match = re.match(r"^(\d{1,2})(?:[:]?(\d{2}))?(am|pm)$", text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        if hour == 12:
+            hour = 0 if match.group(3) == "am" else 12
+        elif match.group(3) == "pm":
+            hour += 12
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return f"{hour:02d}:{minute:02d}"
+        return None
+
+    match = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return f"{hour:02d}:{minute:02d}"
+        return None
+
+    if text.isdigit():
+        hour = 0
+        minute = 0
+        if len(text) == 4:
+            hour = int(text[:2])
+            minute = int(text[2:])
+        elif len(text) == 3:
+            hour = int(text[:1])
+            minute = int(text[1:])
+        elif len(text) in (1, 2):
+            hour = int(text)
+            minute = 0
+        else:
+            return None
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return f"{hour:02d}:{minute:02d}"
+    # Fallback: extract the first HH:MM substring (useful for ISO timestamps)
+    match = re.search(r"(\d{1,2}):(\d{2})", text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return f"{hour:02d}:{minute:02d}"
+    return None
+
+
+def _sanitize_open_houses(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    sanitized: List[Dict[str, Any]] = []
+    issues: List[str] = []
+    for item in entries or []:
+        if not isinstance(item, dict):
+            issues.append(f"Ignored open house entry; expected object, got {type(item).__name__}: {item!r}")
+            continue
+        address_raw = item.get("address")
+        address = str(address_raw).strip() if address_raw is not None else ""
+        slots_raw = item.get("slots") or []
+        if not isinstance(slots_raw, list):
+            issues.append(f"Ignored slots for {address or item!r}; expected list, got {type(slots_raw).__name__}")
+            slots_raw = []
+        slots: List[Dict[str, str]] = []
+        for slot in slots_raw:
+            if not isinstance(slot, dict):
+                issues.append(f"Ignored slot entry; expected object, got {type(slot).__name__}: {slot!r}")
+                continue
+            start = _normalize_time_string(slot.get("start"))
+            end = _normalize_time_string(slot.get("end"))
+            if start and end:
+                slots.append({"start": start, "end": end})
+            else:
+                issues.append(
+                    f"Ignored slot for {address or item!r}; unable to parse times {slot.get('start')!r}, {slot.get('end')!r}"
+                )
+        if address and slots:
+            pid_raw = item.get("property_id")
+            pid = str(pid_raw).strip() if pid_raw not in (None, "") else None
+            sanitized.append({"property_id": pid, "address": address, "slots": slots})
+        else:
+            if not address:
+                issues.append(f"Open house missing address: {item!r}")
+            if not slots:
+                issues.append(f"Open house missing valid slots for {address or item!r}")
+    return sanitized, issues
+
+
+def _sanitize_windows(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[str, str]], List[str]]:
+    windows: List[Dict[str, str]] = []
+    issues: List[str] = []
+    for item in entries or []:
+        if not isinstance(item, dict):
+            issues.append(f"Ignored preferred window; expected object, got {type(item).__name__}: {item!r}")
+            continue
+        start = _normalize_time_string(item.get("start"))
+        end = _normalize_time_string(item.get("end"))
+        if start and end:
+            windows.append({"start": start, "end": end})
+        else:
+            issues.append(
+                f"Ignored preferred window; unable to parse times {item.get('start')!r}, {item.get('end')!r}"
+            )
+    return windows, issues
 
 
 def plan_tours(inp: TourInput) -> Dict[str, Any]:
@@ -1005,14 +1244,21 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
     if done and result.get("status") == "summary":
         # Check if user confirmed (looking for affirmative response)
         if user_message and user_message.strip().lower() in ["yes", "y", "confirmed", "correct", "confirm"]:
-            next_node = "search_and_match"
+            next_node = "tour_plan_tool"
             # Auto-execute search and match
             try:
-                matches = search_and_match(session)
+                match_objs = search_and_match(session)
                 next_step_result = {
                     "step": "search_and_match",
-                    "matches": [m.model_dump() for m in matches],
-                    "count": len(matches)
+                    "matches": [m.model_dump() for m in match_objs],
+                    "open_houses": [
+                        {"property_id": m.property_id, "address": m.address, "slots": m.open_house_slots}
+                        for m in match_objs
+                        if m.open_house_slots
+                    ],
+                    "count": len(match_objs),
+                    "next_node": "tour_plan_tool",
+                    "message": "Review the recommended properties and proceed with tour planning using the provided open house slots."
                 }
                 result["auto_executed_next_step"] = True
             except Exception as e:
@@ -1022,6 +1268,7 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
                     "error": str(e),
                     "message": "Please call search_and_match_tool manually"
                 }
+                next_node = "search_and_match"
         else:
             # Still showing summary, waiting for confirmation
             next_node = "search_and_match"
@@ -1036,20 +1283,101 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
 
 
 @mcp.tool
-def search_and_match_tool(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Run live MLS web search and generate 3–7 recommendations with rationale, commute, and payment estimates."""
+def search_and_match_tool(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Run live MLS web search and return a workflow envelope with property recommendations."""
     sid, session = _get_session(session_id)
     if not intake_is_complete(session):
-        return [{"error": "Intake not complete. Call buyer_intake_step until summary confirmed."}]
-    items = [x.model_dump() for x in search_and_match(session)]
-    return items
+        return {
+            "session_id": sid,
+            "status": "error",
+            "step": "search_and_match",
+            "message": "Intake not complete. Call buyer_intake_step until summary confirmed.",
+            "next_node": "buyer_intake_step",
+        }
+    try:
+        match_objs = search_and_match(session)
+        matches = [x.model_dump() for x in match_objs]
+    except Exception as exc:
+        return {
+            "session_id": sid,
+            "status": "error",
+            "step": "search_and_match",
+            "message": str(exc),
+            "next_node": "search_and_match_tool",
+        }
+
+    return {
+        "session_id": sid,
+        "status": "ok",
+        "step": "search_and_match",
+        "matches": matches,
+        "open_houses": [
+            {"property_id": m.property_id, "address": m.address, "slots": m.open_house_slots}
+            for m in match_objs
+            if m.open_house_slots
+        ],
+        "count": len(matches),
+        "next_node": "tour_plan_tool",
+        "message": "Provide open house options and preferred windows to plan tours.",
+    }
 
 
 @mcp.tool
-def tour_plan_tool(open_houses: List[Dict[str, Any]], preferred_windows: List[Dict[str, str]]) -> Dict[str, Any]:
+def tour_plan_tool(
+    open_houses: Optional[List[Dict[str, Any]]] = None,
+    preferred_windows: Optional[List[Dict[str, str]]] = None,
+    user_message: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Recommend a visit schedule based on open house times and user time preferences."""
-    inp = TourInput(open_houses=open_houses, preferred_windows=preferred_windows)
-    return plan_tours(inp)
+    sid, _ = _get_session(session_id)
+
+    extracted: Dict[str, Any] = {"open_houses": [], "preferred_windows": []}
+    if user_message and user_message.strip():
+        try:
+            extracted = _extract_tour_plan_inputs(user_message)
+        except Exception as exc:  # pragma: no cover
+            log.warning("Tour plan extraction failed; expecting structured inputs: %s", exc)
+
+    parsed_open_houses, open_house_issues = _sanitize_open_houses(open_houses or extracted.get("open_houses"))
+    parsed_windows, window_issues = _sanitize_windows(preferred_windows or extracted.get("preferred_windows"))
+    issues = open_house_issues + window_issues
+
+    if not parsed_open_houses or not parsed_windows:
+        missing = []
+        if not parsed_open_houses:
+            missing.append("open_houses")
+        if not parsed_windows:
+            missing.append("preferred_windows")
+        error_payload = {
+            "session_id": sid,
+            "status": "error",
+            "step": "tour_plan",
+            "message": "Missing required inputs for tour planning.",
+            "missing_inputs": missing,
+            "expected_format": {
+                "open_houses": [{"property_id": "id", "address": "string", "slots": [{"start": "HH:MM", "end": "HH:MM"}]}],
+                "preferred_windows": [{"start": "HH:MM", "end": "HH:MM"}],
+            },
+            "hint": "Provide open house slots and preferred windows via fields or natural language in user_message.",
+            "next_node": "tour_plan_tool",
+        }
+        if issues:
+            error_payload["invalid_inputs"] = issues
+        return error_payload
+
+    plan = plan_tours(TourInput(open_houses=parsed_open_houses, preferred_windows=parsed_windows))
+    response = {
+        "session_id": sid,
+        "status": "ok",
+        "step": "tour_plan",
+        "plan": plan,
+        "message": "Review the proposed tour schedule and adjust inputs if needed.",
+        "next_node": "negotiation_coach_tool",
+    }
+    if issues:
+        response["warnings"] = issues
+    return response
 
 
 @mcp.tool

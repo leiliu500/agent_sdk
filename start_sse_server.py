@@ -102,8 +102,44 @@ TOOL_SCHEMAS = {
             "session_id": {
                 "type": "string",
                 "description": "Session ID"
+            },
+            "open_houses": {
+                "type": "array",
+                "description": "Open house options with availability",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "property_id": {"type": "string"},
+                        "address": {"type": "string"},
+                        "slots": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"}
+                                },
+                                "required": ["start", "end"]
+                            }
+                        }
+                    },
+                    "required": ["property_id", "address", "slots"]
+                }
+            },
+            "preferred_windows": {
+                "type": "array",
+                "description": "Preferred time windows to attend tours",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start": {"type": "string"},
+                        "end": {"type": "string"}
+                    },
+                    "required": ["start", "end"]
+                }
             }
-        }
+        },
+        "required": ["open_houses", "preferred_windows"]
     },
     "disclosure_qa_tool": {
         "type": "object",
