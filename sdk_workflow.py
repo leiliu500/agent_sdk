@@ -248,18 +248,7 @@ def router_route(user_message: str, session: Session) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Buyer‑Intake Sub‑Agent (deterministic stepper, no repeats)
 # ──────────────────────────────────────────────────────────────────────────────
-INTAKE_QUESTIONS = {
-    "budget": "What is your budget range for purchasing your new home?",
-    "locations": "Which city, area, or neighborhoods are you considering?",
-    "home_type": "What type of home would you like? (e.g., single-family, condo, townhouse)",
-    "bedrooms": "How many bedrooms do you need?",
-    "bathrooms": "How many bathrooms do you need?",
-    "financing_status": "What is your financing status? (cash or mortgage; pre-approved?)",
-    "timeline": "What is your timeline to move or purchase?",
-    "must_haves": "What are your must-have features?",
-    "deal_breakers": "Any deal-breakers we should avoid?",
-    "consents": "Do you consent to us storing and using your information to search for properties and contact you with matches? (yes/no)",
-}
+INTAKE_QUESTIONS = prompts.intake_questions()
 
 
 def _normalize_intake_value(field: str, value: Any) -> Optional[str]:
