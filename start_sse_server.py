@@ -58,6 +58,103 @@ TOOL_FUNCTIONS = {
     "reset_session": sdk_workflow.reset_session,
 }
 
+# Manual schemas for tools (since FastMCP wrapping may not expose schemas properly)
+TOOL_SCHEMAS = {
+    "run_workflow": {
+        "type": "object",
+        "properties": {
+            "user_message": {
+                "type": "string",
+                "description": "The user's message to process through the workflow"
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Optional session ID to maintain conversation context"
+            }
+        },
+        "required": ["user_message"]
+    },
+    "buyer_intake_step": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            },
+            "user_message": {
+                "type": "string",
+                "description": "User's response to intake questions"
+            }
+        }
+    },
+    "search_and_match_tool": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            }
+        }
+    },
+    "tour_plan_tool": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            }
+        }
+    },
+    "disclosure_qa_tool": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            },
+            "user_question": {
+                "type": "string",
+                "description": "Question about property disclosures"
+            }
+        }
+    },
+    "offer_drafter_tool": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            }
+        }
+    },
+    "negotiation_coach_tool": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID"
+            },
+            "user_input": {
+                "type": "string",
+                "description": "User's negotiation question or scenario"
+            }
+        }
+    },
+    "health": {
+        "type": "object",
+        "properties": {}
+    },
+    "reset_session": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Session ID to reset"
+            }
+        }
+    }
+}
+
 @app.options("/sse")
 async def sse_options():
     """Handle OPTIONS preflight for SSE endpoint"""
@@ -249,13 +346,20 @@ async def handle_message(request: Request):
     if method == "tools/list":
         tools_list = []
         for tool_name, tool_func in TOOL_FUNCTIONS.items():
+            # Use manual schema if available, otherwise try to get from tool wrapper
+            input_schema = TOOL_SCHEMAS.get(tool_name, {
+                "type": "object",
+                "properties": {}
+            })
+            
+            # Check if the tool has an input_schema attribute (from FastMCP)
+            if hasattr(tool_func, 'input_schema'):
+                input_schema = tool_func.input_schema
+            
             tool_info = {
                 "name": tool_name,
                 "description": tool_func.fn.__doc__ or f"Tool: {tool_name}",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
+                "inputSchema": input_schema
             }
             tools_list.append(tool_info)
         
@@ -432,13 +536,20 @@ async def root_endpoint(request: Request):
     if method == "tools/list":
         tools_list = []
         for tool_name, tool_func in TOOL_FUNCTIONS.items():
+            # Use manual schema if available, otherwise try to get from tool wrapper
+            input_schema = TOOL_SCHEMAS.get(tool_name, {
+                "type": "object",
+                "properties": {}
+            })
+            
+            # Check if the tool has an input_schema attribute (from FastMCP)
+            if hasattr(tool_func, 'input_schema'):
+                input_schema = tool_func.input_schema
+            
             tool_info = {
                 "name": tool_name,
                 "description": tool_func.fn.__doc__ or f"Tool: {tool_name}",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
+                "inputSchema": input_schema
             }
             tools_list.append(tool_info)
         
