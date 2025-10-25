@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Import tool functions directly
-import sdk_workflow
+import real_estate_workflow
 
 app = FastAPI(title="Real Estate MCP Streamable HTTP Server")
 
@@ -47,15 +47,15 @@ last_session_by_ip: Dict[str, str] = {}  # Map IP address to last used session
 
 # Map of tool names to functions
 TOOL_FUNCTIONS = {
-    "run_workflow": sdk_workflow.run_workflow,
-    "buyer_intake_step": sdk_workflow.buyer_intake_step,
-    "search_and_match_tool": sdk_workflow.search_and_match_tool,
-    "tour_plan_tool": sdk_workflow.tour_plan_tool,
-    "disclosure_qa_tool": sdk_workflow.disclosure_qa_tool,
-    "offer_drafter_tool": sdk_workflow.offer_drafter_tool,
-    "negotiation_coach_tool": sdk_workflow.negotiation_coach_tool,
-    "health": sdk_workflow.health,
-    "reset_session": sdk_workflow.reset_session,
+    "run_workflow": real_estate_workflow.run_workflow,
+    "buyer_intake_step": real_estate_workflow.buyer_intake_step,
+    "search_and_match_tool": real_estate_workflow.search_and_match_tool,
+    "tour_plan_tool": real_estate_workflow.tour_plan_tool,
+    "disclosure_qa_tool": real_estate_workflow.disclosure_qa_tool,
+    "offer_drafter_tool": real_estate_workflow.offer_drafter_tool,
+    "negotiation_coach_tool": real_estate_workflow.negotiation_coach_tool,
+    "health": real_estate_workflow.health,
+    "reset_session": real_estate_workflow.reset_session,
 }
 
 # Manual schemas for tools (since FastMCP wrapping may not expose schemas properly)
