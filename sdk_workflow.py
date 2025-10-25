@@ -218,12 +218,7 @@ def router_route(user_message: str, session: Session) -> Dict[str, Any]:
     ]
     history_text = "\n\n".join(history_snippets)
 
-    user_prompt = (
-        "Use prior messages for consistency if relevant (but only extract explicit facts).\n\n"
-        f"Chat History:\n{history_text}\n\n"
-        f"User message:\n{user_message}\n\n"
-        "Return only the JSON."
-    )
+    user_prompt = prompts.router_user_prompt(history_text=history_text, user_message=user_message)
 
     out = llm_json(
         system_prompt=prompts.router_system_prompt(),
@@ -528,15 +523,7 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
         f"Must haves: {criteria.get('must_haves') or 'unspecified'}",
         f"Deal breakers: {criteria.get('deal_breakers') or 'unspecified'}",
     ]
-    user_prompt = (
-        "Search each site `" +
-        "`, `".join(MLS_SEARCH_DOMAINS) +
-        "` using the web_search tool with explicit `site:` filters. Focus on residential listings that "
-        "best match the buyer intake. For every listing include the verified price, headline address, "
-        "beds/baths, direct URL, and any published open house time ranges formatted as HH:MM 24-hour "
-        "open_house_slots. If information is missing or cannot be verified, omit the listing.\n\n"
-        "Buyer intake summary:\n- " + "\n- ".join(criteria_lines)
-    )
+    user_prompt = prompts.mls_web_search_user_prompt(MLS_SEARCH_DOMAINS, criteria_lines)
 
     resp = client.responses.create(
         model="gpt-4.1-mini",

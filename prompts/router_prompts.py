@@ -12,3 +12,13 @@ def router_system_prompt() -> str:
         "If the user's request is ambiguous or falls outside the provided intent categories, use 'general'.\n"
         "Always reason step-by-step internally and only output the final JSON."
     )
+
+
+def router_user_prompt(history_text: str, user_message: str) -> str:
+    """Compose the router user prompt with optional conversation history."""
+    return (
+        "Use prior messages for consistency if relevant (but only extract explicit facts).\n\n"
+        f"Chat History:\n{history_text}\n\n"
+        f"User message:\n{user_message}\n\n"
+        "Return only the JSON."
+    )
