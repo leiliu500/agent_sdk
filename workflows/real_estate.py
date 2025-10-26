@@ -57,7 +57,7 @@ from openai import OpenAI
 from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from openai.types.responses.web_search_tool_param import UserLocation
 from openai.types.shared import Reasoning
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 import prompts
 from schemas import (
@@ -237,6 +237,7 @@ def jailbreak_check(user_message: str) -> GuardrailResult:
 
 
 class RouterSlotsModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     budget: Optional[str] = None
     areas: Optional[str] = None
     timing: Optional[str] = None
@@ -264,17 +265,20 @@ class RouterOutputModel(BaseModel):
 
 
 class SearchQueryModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     domain: str
     query: str
     result_summary: str
 
 
 class ListingSlotModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     start: str
     end: str
 
 
 class ListingModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     property_id: Optional[str] = None
     address: str
     list_price: Union[str, float, None] = None
@@ -289,11 +293,13 @@ class ListingModel(BaseModel):
 
 
 class MLSWebSearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     search_queries: List[SearchQueryModel]
     listings: List[ListingModel]
 
 
 class IntakeSlotsModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     budget: Optional[str] = None
     locations: Optional[str] = None
     home_type: Optional[str] = None
@@ -310,12 +316,13 @@ class IntakeSlotsModel(BaseModel):
 
 
 class IntakeAgentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     status: Literal["ask", "summary", "confirmed"]
     message: str
     field: Optional[str] = None
     next_field: Optional[str] = None
     slots: IntakeSlotsModel = Field(default_factory=IntakeSlotsModel)
-    summary: Optional[Dict[str, Optional[str]]] = None
+    summary: Optional[IntakeSlotsModel] = None
 
     @model_validator(mode="after")
     def _validate_next_field(self) -> "IntakeAgentOutput":
@@ -325,11 +332,12 @@ class IntakeAgentOutput(BaseModel):
         if self.status == "ask" and not self.field:
             self.field = self.next_field
         if self.status in {"summary", "confirmed"} and self.summary is None:
-            self.summary = {
+            summary_payload = {
                 key: value
                 for key, value in self.slots.as_dict().items()
                 if value not in (None, "")
             }
+            self.summary = IntakeSlotsModel(**summary_payload)
         return self
 
 
@@ -630,7 +638,6 @@ def _build_intake_agent_input(
     user_message: Optional[str],
     slot_hints: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    items = list(session.intake_agent_items)
     context_payload = {
         "current_state": _intake_state_snapshot(session.intake),
         "next_field": session.intake.next_field,
@@ -642,8 +649,7 @@ def _build_intake_agent_input(
         content_blocks.append({"type": "input_text", "text": f"USER_MESSAGE:\n{user_message}"})
     else:
         content_blocks.append({"type": "input_text", "text": "USER_MESSAGE:\n"})
-    items.append({"role": "user", "content": content_blocks})
-    return items
+    return [{"role": "user", "content": content_blocks}]
 
 
 def _update_intake_state_from_slots(intake: IntakeState, slots: IntakeSlotsModel) -> None:
@@ -672,13 +678,7 @@ def intake_step(
         log.exception("Buyer intake agent run failed; falling back to legacy flow", exc_info=exc)
         return _legacy_intake_step(session, user_message, slot_hints)
 
-    serialized_history: List[Dict[str, Any]] = []
-    for item in result.to_input_list():
-        if isinstance(item, BaseModel):
-            serialized_history.append(item.model_dump(mode="json", exclude_none=True))
-        else:
-            serialized_history.append(item)
-    session.intake_agent_items = serialized_history[-16:]
+    session.intake_agent_items = []
 
     try:
         agent_output = result.final_output_as(IntakeAgentOutput, raise_if_incorrect_type=True)
@@ -693,7 +693,10 @@ def intake_step(
     else:
         _sync_next_field(intake)
 
-    summary = agent_output.summary
+    summary_model = agent_output.summary
+    summary: Optional[Dict[str, Optional[str]]] = None
+    if summary_model is not None:
+        summary = summary_model.model_dump(exclude_none=True)
     if agent_output.status in {"summary", "confirmed"}:
         if summary is None:
             summary = _intake_state_snapshot(intake)
@@ -725,6 +728,7 @@ def intake_is_complete(session: Session) -> bool:
 # Search & match helpers
 # ---------------------------------------------------------------------------
 class MatchItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     property_id: str
     address: str
     fit_rationale: str
@@ -1033,6 +1037,7 @@ def search_and_match(session: Session) -> List[MatchItem]:
 # Tour planning helpers
 # ---------------------------------------------------------------------------
 class TourInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     open_houses: List[Dict[str, Any]] = Field(
         description="List of {property_id, address, slots:[{'start':'HH:MM','end':'HH:MM'}]}"
     )
@@ -1516,6 +1521,7 @@ def plan_tours(inp: TourInput) -> Dict[str, Any]:
 # Disclosure Q&A helper
 # ---------------------------------------------------------------------------
 class QAFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str
     content: str
 
