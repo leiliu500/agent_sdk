@@ -49,7 +49,7 @@ import threading
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from agents.agent import Agent
@@ -68,7 +68,6 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 import prompts
 from schemas import (
     get_intake_extraction_schema,
-    get_mls_web_search_schema,
     get_negotiation_coach_schema,
     get_offer_drafter_schema,
     get_required_intake_fields,
@@ -115,48 +114,6 @@ LOCAL_GUARDRAIL_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bbreak the rules\b", re.IGNORECASE), "rule_breaking"),
     (re.compile(r"\b(?:buy|purchase|own)\s+(?:every|all|the entire)\s+(?:house(?:s)?|home(?:s)?|property|properties|real\s+estate)\b", re.IGNORECASE), "market_domination"),
 ]
-
-
-def _run_async_callable_sync(factory: Callable[[], Awaitable[Any]], *, thread_name: str) -> Any:
-    """Run an async callable to completion even when already inside an event loop."""
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        result_queue: Queue[Tuple[bool, Any]] = Queue()
-
-        def _target() -> None:
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            try:
-                run_result = new_loop.run_until_complete(factory())
-                result_queue.put((True, run_result))
-            except Exception as exc:  # pragma: no cover - propagate failure
-                result_queue.put((False, exc))
-            finally:
-                try:
-                    new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-                except Exception:
-                    pass
-                new_loop.close()
-                asyncio.set_event_loop(None)
-
-        thread = threading.Thread(target=_target, name=thread_name, daemon=True)
-        thread.start()
-        thread.join()
-
-        try:
-            success, payload = result_queue.get_nowait()
-        except Empty as missing:  # pragma: no cover - defensive
-            raise RuntimeError(f"{thread_name} thread completed without returning a result") from missing
-        if success:
-            return payload
-        raise payload
-
-    return asyncio.run(factory())
 
 
 def _can_set_temperature(model: str, temperature: Optional[float]) -> bool:
