@@ -14,6 +14,7 @@ Features
     * Disclosure Q&A (file-based Q&A with sentence-level citations)
     * Offer Drafter (compliant draft + checklist)
     * Negotiation Coach (market-context driven offer logic)
+- Enhanced workflow orchestration with conversation history and state management
 
 Run
     uv run python real_estate_mcp_server.py  # or: python real_estate_mcp_server.py
@@ -28,6 +29,7 @@ Notes
     orchestrator tool (run_workflow) or compose calls to the sub-agents.
 - Replace the MLS and commute/payment stubs with your production integrations.
 - All LLM calls use JSON-schema constrained responses for robust outputs.
+- Enhanced workflow pattern supports conversation history tracking and conditional execution
 
 Implementation note: the original ``real_estate_workflow`` module now serves as
 a compatibility shim that re-exports these symbols so legacy imports continue to
@@ -45,15 +47,16 @@ import asyncio
 import threading
 from dataclasses import dataclass, field
 from queue import Empty, Queue
+from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from agents.agent import Agent
 from agents.model_settings import ModelSettings
-from agents.run import Runner
+from agents.run import Runner, RunConfig
 from agents.tool import WebSearchTool
 from agents.tracing import agent_span, get_current_trace, trace
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from openai.types.responses.web_search_tool_param import UserLocation
 from openai.types.shared import Reasoning
@@ -70,6 +73,9 @@ from schemas import (
     get_tour_plan_extraction_schema,
     get_tour_plan_generation_schema,
 )
+
+# Type alias for conversation history items
+TResponseInputItem = Dict[str, Any]
 
 # Load environment variables from .env file once at module import time.
 load_dotenv()
@@ -93,7 +99,11 @@ if not log.handlers:
 # OpenAI client & guardrails helpers
 # ---------------------------------------------------------------------------
 client = OpenAI()
+async_client = AsyncOpenAI()
 JSON_DECODER = json.JSONDecoder()
+
+# Shared context for guardrails
+ctx = SimpleNamespace(guardrail_llm=async_client)
 
 
 def _can_set_temperature(model: str, temperature: Optional[float]) -> bool:
@@ -116,6 +126,53 @@ try:  # Guardrails import is optional at runtime
     _HAS_GUARDRAILS = True
 except Exception:  # pragma: no cover
     _HAS_GUARDRAILS = False
+
+
+# ---------------------------------------------------------------------------
+# Enhanced Guardrails helpers (following workflow pattern)
+# ---------------------------------------------------------------------------
+def guardrails_has_tripwire(results):
+    """Check if any guardrail result triggered a tripwire."""
+    return any(getattr(r, "tripwire_triggered", False) is True for r in (results or []))
+
+
+def get_guardrail_checked_text(results, fallback_text):
+    """Extract checked text from guardrail results."""
+    for r in (results or []):
+        info = getattr(r, "info", None) or {}
+        if isinstance(info, dict) and ("checked_text" in info):
+            return info.get("checked_text") or fallback_text
+    return fallback_text
+
+
+def build_guardrail_fail_output(results):
+    """Build failure output from guardrail results."""
+    failures = []
+    for r in (results or []):
+        if getattr(r, "tripwire_triggered", False):
+            info = getattr(r, "info", None) or {}
+            failure = {
+                "guardrail_name": info.get("guardrail_name"),
+            }
+            for key in ("flagged", "confidence", "threshold", "hallucination_type", "hallucinated_statements", "verified_statements"):
+                if key in (info or {}):
+                    failure[key] = info.get(key)
+            failures.append(failure)
+    return {"failed": len(failures) > 0, "failures": failures}
+
+
+# Guardrails configuration
+GUARDRAILS_CONFIG = {
+    "guardrails": [
+        {
+            "name": "Jailbreak",
+            "config": {
+                "model": "gpt-4o-mini",
+                "confidence_threshold": 0.7
+            }
+        }
+    ]
+}
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +201,8 @@ class Session:
     intake: IntakeState = field(default_factory=IntakeState)
     agent_items: List[Dict[str, Any]] = field(default_factory=list)
     intake_agent_items: List[Dict[str, Any]] = field(default_factory=list)
+    # Enhanced workflow conversation history
+    conversation_history: List[TResponseInputItem] = field(default_factory=list)
 
 
 SESSIONS: Dict[str, Session] = {}
@@ -1581,66 +1640,217 @@ def disclosure_qa(files: List[QAFile], question: str) -> Dict[str, Any]:
 mcp = FastMCP("RealEstate Workflow MCP")
 
 
-@mcp.tool
-def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-    sid, session = _get_session(session_id)
-    with trace("Real Estate Workflow"):
-        guard = jailbreak_check(user_message)
-        if not guard.allowed:
-            return {
-                "session_id": sid,
-                "status": "blocked",
-                "reason": "Guardrails/Jailbreak check failed",
-                "details": guard.reasons,
-            }
+# ---------------------------------------------------------------------------
+# Enhanced workflow execution (following workflow pattern)
+# ---------------------------------------------------------------------------
+class WorkflowInput(BaseModel):
+    """Input model for workflow execution."""
+    input_as_text: str
+    session_id: Optional[str] = None
 
-        routed = router_route(user_message, session)
-        intent = routed.get("intent", "general")
 
-        next_node = None
-        next_step_result = None
-
-        if intent == "buy":
-            next_node = "buyer_intake_step"
-            intake_result = intake_step(session, user_message, routed.get("slots_obj"))
-            next_step_result = {
-                "step": "buyer_intake_step",
-                "result": intake_result,
-                "intake_complete": intake_is_complete(session),
+async def run_enhanced_workflow(workflow_input: WorkflowInput) -> Dict[str, Any]:
+    """
+    Enhanced workflow execution following the pattern with conversation history,
+    guardrails, and conditional agent routing.
+    """
+    with trace("Real Estate Workflow Enhanced"):
+        # Get or create session
+        sid, session = _get_session(workflow_input.session_id)
+        
+        # Initialize conversation history for this workflow run
+        user_message = workflow_input.input_as_text
+        conversation_history: List[TResponseInputItem] = list(session.conversation_history)
+        
+        # Add user message to conversation history
+        conversation_history.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": user_message
+                }
+            ]
+        })
+        
+        # Step 1: Run guardrails check
+        guardrails_inputtext = user_message
+        try:
+            if _HAS_GUARDRAILS:
+                guardrails_result = await run_guardrails(
+                    ctx, 
+                    guardrails_inputtext, 
+                    "text/plain", 
+                    instantiate_guardrails(load_config_bundle(GUARDRAILS_CONFIG)), 
+                    suppress_tripwire=True, 
+                    raise_guardrail_errors=True
+                )
+                guardrails_hastripwire = guardrails_has_tripwire(guardrails_result)
+                guardrails_anonymizedtext = get_guardrail_checked_text(guardrails_result, guardrails_inputtext)
+                guardrails_output = (guardrails_hastripwire and build_guardrail_fail_output(guardrails_result or [])) or (guardrails_anonymizedtext or guardrails_inputtext)
+                
+                if guardrails_hastripwire:
+                    return {
+                        "session_id": sid,
+                        "status": "blocked",
+                        "guardrails_output": guardrails_output
+                    }
+            else:
+                # Fallback to basic moderation check
+                guard = jailbreak_check(user_message)
+                if not guard.allowed:
+                    return {
+                        "session_id": sid,
+                        "status": "blocked",
+                        "reason": "Guardrails/Jailbreak check failed",
+                        "details": guard.reasons,
+                    }
+        except Exception as exc:
+            log.warning("Guardrails check failed, proceeding without guardrails: %s", exc)
+        
+        # Step 2: Run router with conversation history context
+        router_input = [
+            *conversation_history,
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "You need to remember chat history and use chat history to provide consistent analysis of routing decisions"
+                    }
+                ]
             }
-        elif intent == "disclosures":
-            next_node = "disclosure_qa"
-            next_step_result = {
-                "step": "disclosure_qa",
-                "message": "Please provide the disclosure documents and your specific question.",
-            }
-        elif intent == "offer":
-            next_node = "offer_drafter"
-            next_step_result = {
-                "step": "offer_drafter",
-                "message": "Please provide property details to draft an offer.",
-            }
-        elif intent == "sell":
-            next_node = "general_sell_agent"
-            next_step_result = {
-                "step": "general_sell_agent",
-                "message": "Selling agent workflow - please provide property details.",
-            }
-        else:
-            next_node = "general"
-            next_step_result = {
-                "step": "general",
-                "message": "I can help you with buying, selling, or property disclosures. How can I assist you?",
-            }
-
-        return {
+        ]
+        
+        router_result_temp = await Runner.run(
+            ROUTER_AGENT,
+            input=router_input,
+            run_config=RunConfig(trace_metadata={
+                "__trace_source__": "agent-builder",
+                "workflow_id": f"wf_{uuid.uuid4().hex}",
+                "session_id": sid
+            })
+        )
+        
+        # Update conversation history with router response
+        conversation_history.extend([item.to_input_item() for item in router_result_temp.new_items])
+        
+        router_output = router_result_temp.final_output_as(RouterOutputModel, raise_if_incorrect_type=True)
+        router_result = {
+            "output_text": router_output.model_dump_json(),
+            "output_parsed": router_output.model_dump()
+        }
+        
+        # Step 3: Route to appropriate agent based on intent
+        intent = router_result["output_parsed"]["intent"]
+        slots_obj = router_output.slots_as_dict()
+        
+        final_result = {
             "session_id": sid,
             "status": "ok",
-            "router": routed,
-            "slots_obj": routed.get("slots_obj", {}),
-            "next_node": next_node,
-            "next_step_result": next_step_result,
+            "router": router_result,
+            "intent": intent,
+            "slots": slots_obj,
         }
+        
+        # Route based on intent
+        if intent == 'buy':
+            # Run buyer intake workflow
+            intake_result = intake_step(session, user_message, slots_obj)
+            
+            # Check if intake is complete
+            if intake_is_complete(session) and intake_result.get("status") == "confirmed":
+                # Auto-execute search & match
+                try:
+                    match_objs = search_and_match(session)
+                    matches_payload = [match.model_dump() for match in match_objs]
+                    
+                    final_result["buyer_intake"] = intake_result
+                    final_result["search_and_match"] = {
+                        "matches": matches_payload,
+                        "count": len(matches_payload),
+                        "message": f"Found {len(matches_payload)} matching properties based on your criteria."
+                    }
+                    final_result["next_step"] = "tour_planning"
+                except Exception as exc:
+                    log.exception("Failed to auto-execute search_and_match: %s", exc)
+                    final_result["buyer_intake"] = intake_result
+                    final_result["error"] = str(exc)
+                    final_result["next_step"] = "search_and_match"
+            else:
+                final_result["buyer_intake"] = intake_result
+                final_result["next_step"] = "continue_intake"
+                
+        elif intent == 'sell':
+            # For sell intent, provide seller workflow message
+            final_result["message"] = "Seller workflow activated. Please provide your property details to begin the listing process."
+            final_result["next_step"] = "seller_intake"
+            
+        elif intent == 'disclosures':
+            # For disclosure requests
+            final_result["message"] = "Please provide the disclosure documents and your specific question."
+            final_result["next_step"] = "disclosure_qa"
+            
+        elif intent == 'offer':
+            # For offer drafting
+            final_result["message"] = "Please provide property details to draft an offer."
+            final_result["next_step"] = "offer_drafter"
+            
+        else:
+            # General intent
+            final_result["message"] = "I can help you with buying, selling, property disclosures, or drafting offers. How can I assist you?"
+            final_result["next_step"] = "router"
+        
+        # Update session conversation history
+        session.conversation_history = conversation_history
+        
+        return final_result
+
+
+@mcp.tool
+def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Main workflow orchestrator. Routes user messages through guardrails, intent detection,
+    and appropriate sub-agents.
+    
+    Args:
+        user_message: The user's input message
+        session_id: Optional session identifier for conversation continuity
+        
+    Returns:
+        Dictionary containing workflow results, intent, and next steps
+    """
+    workflow_input = WorkflowInput(input_as_text=user_message, session_id=session_id)
+    
+    # Check if we're in an async context
+    try:
+        loop = asyncio.get_running_loop()
+        # If we have a running loop, we need to run in a new thread
+        result_queue: Queue[Tuple[bool, Any]] = Queue()
+        
+        def _async_runner():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                result = new_loop.run_until_complete(run_enhanced_workflow(workflow_input))
+                result_queue.put((True, result))
+            except Exception as exc:
+                result_queue.put((False, exc))
+            finally:
+                new_loop.close()
+        
+        thread = threading.Thread(target=_async_runner, daemon=True)
+        thread.start()
+        thread.join()
+        
+        success, payload = result_queue.get()
+        if success:
+            return payload
+        raise payload
+        
+    except RuntimeError:
+        # No running loop, we can create one
+        return asyncio.run(run_enhanced_workflow(workflow_input))
 
 
 @mcp.tool
@@ -1873,15 +2083,22 @@ def reset_session(session_id: Optional[str] = None) -> Dict[str, Any]:
 
 
 __all__ = [
+    "AsyncOpenAI",
     "FastMCP",
     "GuardrailResult",
     "IntakeState",
     "MatchItem",
     "QAFile",
+    "RunConfig",
     "Session",
+    "TResponseInputItem",
+    "WorkflowInput",
+    "build_guardrail_fail_output",
     "buyer_intake_step",
     "disclosure_qa",
     "disclosure_qa_tool",
+    "get_guardrail_checked_text",
+    "guardrails_has_tripwire",
     "health",
     "intake_is_complete",
     "intake_step",
@@ -1893,6 +2110,7 @@ __all__ = [
     "plan_tours",
     "reset_session",
     "router_route",
+    "run_enhanced_workflow",
     "run_workflow",
     "search_and_match",
     "search_and_match_tool",
