@@ -232,23 +232,36 @@ def llm_json(
     model: str = "gpt-4o-mini",
     temperature: Optional[float] = 0.2,
 ) -> Dict[str, Any]:
-    """Call the Chat Completions API and coerce the response to JSON."""
+    """Call the Responses API and coerce the response to JSON."""
 
     request_args: Dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": system_prompt},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
         ],
         "response_format": {"type": "json_schema", "json_schema": json_schema},
     }
     if _can_set_temperature(model, temperature):
         request_args["temperature"] = temperature
 
-    resp = client.chat.completions.create(**request_args)
+    resp = client.responses.create(**request_args)
     try:
-        text = resp.choices[0].message.content
-        return json.loads(text)
+        raw_text = _response_output_text(resp)
+        parsed = _parse_json_from_text(raw_text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Response payload is not a JSON object")
+        return parsed
     except Exception as exc:  # pragma: no cover
         log.exception("Failed to parse JSON response: %s", exc)
         raise
