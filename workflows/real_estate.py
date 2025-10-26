@@ -37,6 +37,7 @@ function without change.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -48,15 +49,17 @@ import threading
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 from agents.agent import Agent
+from agents.agent_output import AgentOutputSchemaBase
+from agents.exceptions import ModelBehaviorError
 from agents.model_settings import ModelSettings
 from agents.run import Runner, RunConfig
 from agents.tool import WebSearchTool
 from agents.tracing import agent_span, get_current_trace, trace
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
 from openai.types.responses.web_search_tool_param import UserLocation
 from openai.types.shared import Reasoning
@@ -98,12 +101,62 @@ if not log.handlers:
 # ---------------------------------------------------------------------------
 # OpenAI client & guardrails helpers
 # ---------------------------------------------------------------------------
-client = OpenAI()
 async_client = AsyncOpenAI()
 JSON_DECODER = json.JSONDecoder()
 
 # Shared context for guardrails
 ctx = SimpleNamespace(guardrail_llm=async_client)
+MODERATION_MODEL = os.environ.get("OPENAI_MODERATION_MODEL", "omni-moderation-latest")
+
+LOCAL_GUARDRAIL_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bi am your (?:boss|master|owner|creator)\b", re.IGNORECASE), "authority_override"),
+    (re.compile(r"\bignore (?:all|any) (?:previous|prior|earlier) instructions\b", re.IGNORECASE), "ignore_safety_instructions"),
+    (re.compile(r"\bthis is a jailbreak\b", re.IGNORECASE), "jailbreak_signal"),
+    (re.compile(r"\bbreak the rules\b", re.IGNORECASE), "rule_breaking"),
+    (re.compile(r"\b(?:buy|purchase|own)\s+(?:every|all|the entire)\s+(?:house(?:s)?|home(?:s)?|property|properties|real\s+estate)\b", re.IGNORECASE), "market_domination"),
+]
+
+
+def _run_async_callable_sync(factory: Callable[[], Awaitable[Any]], *, thread_name: str) -> Any:
+    """Run an async callable to completion even when already inside an event loop."""
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        result_queue: Queue[Tuple[bool, Any]] = Queue()
+
+        def _target() -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                run_result = new_loop.run_until_complete(factory())
+                result_queue.put((True, run_result))
+            except Exception as exc:  # pragma: no cover - propagate failure
+                result_queue.put((False, exc))
+            finally:
+                try:
+                    new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                new_loop.close()
+                asyncio.set_event_loop(None)
+
+        thread = threading.Thread(target=_target, name=thread_name, daemon=True)
+        thread.start()
+        thread.join()
+
+        try:
+            success, payload = result_queue.get_nowait()
+        except Empty as missing:  # pragma: no cover - defensive
+            raise RuntimeError(f"{thread_name} thread completed without returning a result") from missing
+        if success:
+            return payload
+        raise payload
+
+    return asyncio.run(factory())
 
 
 def _can_set_temperature(model: str, temperature: Optional[float]) -> bool:
@@ -116,8 +169,8 @@ def _can_set_temperature(model: str, temperature: Optional[float]) -> bool:
         return False
     return True
 
-try:  # Guardrails import is optional at runtime
-    from openai_guardrails.runtime import (  # type: ignore
+try:  # pragma: no cover - optional guardrails dependency
+    from guardrails.runtime import (  # type: ignore
         instantiate_guardrails,
         load_config_bundle,
         run_guardrails,
@@ -125,40 +178,169 @@ try:  # Guardrails import is optional at runtime
 
     _HAS_GUARDRAILS = True
 except Exception:  # pragma: no cover
-    _HAS_GUARDRAILS = False
+    try:
+        from openai_guardrails.runtime import (  # type: ignore
+            instantiate_guardrails,
+            load_config_bundle,
+            run_guardrails,
+        )
+
+        _HAS_GUARDRAILS = True
+    except Exception:  # pragma: no cover
+        instantiate_guardrails = load_config_bundle = run_guardrails = None  # type: ignore
+        _HAS_GUARDRAILS = False
 
 
 # ---------------------------------------------------------------------------
 # Enhanced Guardrails helpers (following workflow pattern)
 # ---------------------------------------------------------------------------
+def _guardrail_get(result: Any, attr: str, default: Any = None) -> Any:
+    """Safely read attributes or dict keys from guardrail results."""
+
+    if isinstance(result, dict):
+        return result.get(attr, default)
+    return getattr(result, attr, default)
+
+
+def _guardrail_entries(results: Any) -> List[Any]:
+    """Normalize guardrail results into a flat list for inspection."""
+
+    if results is None:
+        return []
+    if isinstance(results, (list, tuple)):
+        return [item for item in results if item is not None]
+
+    nested = _guardrail_get(results, "results")
+    if nested is not None:
+        if isinstance(nested, (list, tuple)):
+            return [item for item in nested if item is not None]
+        return [nested]
+
+    return [results]
+
+
 def guardrails_has_tripwire(results):
     """Check if any guardrail result triggered a tripwire."""
-    return any(getattr(r, "tripwire_triggered", False) is True for r in (results or []))
+
+    top_level_tripwire = _guardrail_get(results, "tripwire_triggered")
+    if top_level_tripwire is True:
+        return True
+
+    for item in _guardrail_entries(results):
+        tripwire = _guardrail_get(item, "tripwire_triggered")
+        if tripwire is True:
+            return True
+        outcome = _guardrail_get(item, "outcome")
+        if outcome and str(outcome).lower() in {"tripwire_triggered", "blocked", "fail"}:
+            return True
+    return False
 
 
 def get_guardrail_checked_text(results, fallback_text):
     """Extract checked text from guardrail results."""
-    for r in (results or []):
-        info = getattr(r, "info", None) or {}
-        if isinstance(info, dict) and ("checked_text" in info):
-            return info.get("checked_text") or fallback_text
+
+    checked_top = _guardrail_get(results, "checked_text")
+    if checked_top:
+        return checked_top
+
+    for item in _guardrail_entries(results):
+        info = _guardrail_get(item, "info") or {}
+        if not isinstance(info, dict):
+            continue
+        checked = info.get("checked_text")
+        if checked:
+            return checked
     return fallback_text
 
 
 def build_guardrail_fail_output(results):
     """Build failure output from guardrail results."""
+
     failures = []
-    for r in (results or []):
-        if getattr(r, "tripwire_triggered", False):
-            info = getattr(r, "info", None) or {}
-            failure = {
-                "guardrail_name": info.get("guardrail_name"),
-            }
-            for key in ("flagged", "confidence", "threshold", "hallucination_type", "hallucinated_statements", "verified_statements"):
-                if key in (info or {}):
-                    failure[key] = info.get(key)
-            failures.append(failure)
+    for item in _guardrail_entries(results):
+        tripwire = _guardrail_get(item, "tripwire_triggered")
+        outcome = _guardrail_get(item, "outcome")
+        if not (tripwire is True or (outcome and str(outcome).lower() in {"tripwire_triggered", "blocked", "fail"})):
+            continue
+
+        info = _guardrail_get(item, "info") or {}
+        info_dict = info if isinstance(info, dict) else {}
+        failure = {
+            "guardrail_name": info_dict.get("guardrail_name") or _guardrail_get(item, "guardrail_name"),
+        }
+        for key in (
+            "flagged",
+            "confidence",
+            "threshold",
+            "hallucination_type",
+            "hallucinated_statements",
+            "verified_statements",
+        ):
+            if key in info_dict:
+                failure[key] = info_dict.get(key)
+        failures.append(failure)
     return {"failed": len(failures) > 0, "failures": failures}
+
+
+async def run_moderation_check(text: str) -> Optional[Dict[str, Any]]:
+    """Run OpenAI Moderation as a fallback guardrail check."""
+
+    if not text:
+        return None
+    try:
+        response = await async_client.moderations.create(
+            model=MODERATION_MODEL,
+            input=text,
+        )
+    except Exception as exc:  # pragma: no cover - network/runtime failures
+        log.warning("Moderation check failed: %s", exc)
+        return None
+
+    results = getattr(response, "results", None) or []
+    if not results:
+        return None
+
+    entry = results[0]
+    flagged = _guardrail_get(entry, "flagged") is True
+    if not flagged:
+        return None
+
+    categories = _guardrail_get(entry, "categories") or {}
+    category_scores = _guardrail_get(entry, "category_scores") or {}
+    flagged_categories: Dict[str, float] = {}
+    if isinstance(categories, dict):
+        for name, is_flagged in categories.items():
+            if is_flagged:
+                score = category_scores.get(name) if isinstance(category_scores, dict) else None
+                flagged_categories[name] = float(score) if isinstance(score, (int, float)) else None
+
+    return {
+        "failed": True,
+        "source": "moderation",
+        "model": getattr(response, "model", MODERATION_MODEL),
+        "flagged_categories": flagged_categories,
+    }
+
+
+def run_local_guardrail_check(text: str) -> Optional[Dict[str, Any]]:
+    """Run lightweight heuristic guardrail checks for known jailbreak patterns."""
+
+    if not text:
+        return None
+
+    matches: List[str] = []
+    for pattern, label in LOCAL_GUARDRAIL_PATTERNS:
+        if pattern.search(text):
+            matches.append(label)
+
+    if not matches:
+        return None
+
+    return {
+        "failed": True,
+        "source": "local",
+        "matched_categories": matches,
+    }
 
 
 # Guardrails configuration
@@ -167,7 +349,7 @@ GUARDRAILS_CONFIG = {
         {
             "name": "Jailbreak",
             "config": {
-                "model": "gpt-4o-mini",
+                "model": "gpt-4.1-mini",
                 "confidence_threshold": 0.7
             }
         }
@@ -224,6 +406,43 @@ def _get_session(session_id: Optional[str]) -> Tuple[str, Session]:
 # LLM helper utilities
 # ---------------------------------------------------------------------------
 
+
+class JsonSchemaOutput(AgentOutputSchemaBase):
+    """Custom output schema adapter that validates JSON against a provided schema."""
+
+    def __init__(self, schema_def: Dict[str, Any]) -> None:
+        if not isinstance(schema_def, dict):
+            raise ValueError("json_schema must be a dict")
+        if "schema" not in schema_def:
+            raise ValueError("json_schema must include a 'schema' definition")
+        self._schema_wrapper = copy.deepcopy(schema_def)
+        self._name = self._schema_wrapper.get("name", "structured_output")
+        self._strict = bool(self._schema_wrapper.get("strict", False))
+
+    def is_plain_text(self) -> bool:
+        return False
+
+    def name(self) -> str:
+        return self._name
+
+    def json_schema(self) -> Dict[str, Any]:
+        return self._schema_wrapper
+
+    def is_strict_json_schema(self) -> bool:
+        return self._strict
+
+    def validate_json(self, json_str: str) -> Any:
+        try:
+            parsed = _parse_json_from_text(json_str)
+        except Exception as exc:  # pragma: no cover - propagate with structured error
+            raise ModelBehaviorError(f"Invalid JSON for {self._name}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ModelBehaviorError(
+                f"Expected JSON object for {self._name}, got {type(parsed).__name__}"
+            )
+        return parsed
+
+
 def llm_json(
     *,
     system_prompt: str,
@@ -232,76 +451,58 @@ def llm_json(
     model: str = "gpt-4o-mini",
     temperature: Optional[float] = 0.2,
 ) -> Dict[str, Any]:
-    """Call the Responses API and coerce the response to JSON."""
+    """Invoke an Agents SDK helper agent that returns structured JSON."""
 
-    request_args: Dict[str, Any] = {
-        "model": model,
-        "input": [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": system_prompt},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                ],
-            },
-        ],
-        "response_format": {"type": "json_schema", "json_schema": json_schema},
-    }
+    schema_output = JsonSchemaOutput(json_schema)
+    schema_body = json_schema.get("schema", json_schema)
+    schema_text = json.dumps(schema_body, indent=2, ensure_ascii=True)
+    augmented_instructions = (
+        f"{system_prompt.strip()}\n\n"
+        "Respond only with valid JSON that matches the schema below. "
+        "Do not include code fences or extra commentary.\n"
+        f"Schema:{os.linesep}{schema_text}"
+    )
+
+    model_settings: Optional[ModelSettings] = None
     if _can_set_temperature(model, temperature):
-        request_args["temperature"] = temperature
+        model_settings = ModelSettings(temperature=temperature)
 
-    resp = client.responses.create(**request_args)
+    agent_kwargs: Dict[str, Any] = {
+        "name": "StructuredJSONHelper",
+        "instructions": augmented_instructions,
+        "model": model,
+        "output_type": schema_output,
+    }
+    if model_settings is not None:
+        agent_kwargs["model_settings"] = model_settings
+
+    agent = Agent(**agent_kwargs)
+
+    agent_input: List[Dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": user_prompt},
+            ],
+        }
+    ]
+
     try:
-        raw_text = _response_output_text(resp)
-        parsed = _parse_json_from_text(raw_text)
-        if not isinstance(parsed, dict):
-            raise ValueError("Response payload is not a JSON object")
-        return parsed
+        result = _run_agent(agent, agent_input)
     except Exception as exc:  # pragma: no cover
-        log.exception("Failed to parse JSON response: %s", exc)
+        log.exception("Structured JSON agent invocation failed: %s", exc)
+        raise
+
+    try:
+        return result.final_output_as(dict, raise_if_incorrect_type=True)
+    except TypeError as exc:  # pragma: no cover
+        log.exception("Structured JSON agent returned non-dict output: %s", exc)
         raise
 
 
 # ---------------------------------------------------------------------------
 # Guardrails
 # ---------------------------------------------------------------------------
-class GuardrailResult(BaseModel):
-    allowed: bool
-    reasons: List[str] = Field(default_factory=list)
-
-
-def jailbreak_check(user_message: str) -> GuardrailResult:
-    bundle_dir = os.getenv("GUARDRAILS_BUNDLE_DIR")
-    if _HAS_GUARDRAILS and bundle_dir and os.path.isdir(bundle_dir):
-        try:
-            cfg = load_config_bundle(bundle_dir)
-            rails = instantiate_guardrails(cfg)
-            result = run_guardrails(rails, {"user_message": user_message})
-            allowed = result.get("passed", True)
-            reasons = [f"{k}: {v}" for k, v in result.items() if k != "passed"]
-            return GuardrailResult(allowed=allowed, reasons=reasons)
-        except Exception as exc:  # pragma: no cover
-            log.warning("Guardrails execution failed, falling back to Moderations: %s", exc)
-    try:
-        moderation = client.moderations.create(model="omni-moderation-latest", input=user_message)
-        flagged = any(cat for cat, val in moderation.results[0].categories.to_dict().items() if val)  # type: ignore
-        if flagged:
-            reasons = [
-                key
-                for key, score in moderation.results[0].category_scores.to_dict().items()  # type: ignore
-                if score and score > 0.5
-            ]
-            return GuardrailResult(allowed=False, reasons=reasons)
-        return GuardrailResult(allowed=True)
-    except Exception as exc:  # pragma: no cover
-        log.warning("Moderations failed open; allowing request. Error: %s", exc)
-        return GuardrailResult(allowed=True)
-
 
 # ---------------------------------------------------------------------------
 # Agents SDK configuration
@@ -963,18 +1164,6 @@ def _response_output_text(resp: Any) -> str:
     raise ValueError("No textual output in response")
 
 
-def _schema_to_text_config(schema_def: Dict[str, Any]) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {
-        "type": schema_def.get("type", "json_schema"),
-        "name": schema_def["name"],
-        "schema": schema_def["schema"],
-    }
-    if "description" in schema_def:
-        cfg["description"] = schema_def["description"]
-    if "strict" in schema_def:
-        cfg["strict"] = schema_def["strict"]
-    return {"format": cfg}
-
 
 def _parse_json_from_text(text: str) -> Any:
     cleaned = (text or "").strip()
@@ -1021,32 +1210,9 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
             result = _run_agent(MLS_SEARCH_AGENT, user_prompt)
         payload = result.final_output_as(MLSWebSearchResult, raise_if_incorrect_type=True)
         return payload.model_dump(mode="json")
-    except Exception as exc:  # pragma: no cover - fallback path
-        log.exception("Search agent run failed; falling back to Responses API", exc_info=exc)
-
-        model_name = "gpt-4o-mini"
-        request_args: Dict[str, Any] = {
-            "model": model_name,
-            "input": [
-                {"role": "system", "content": prompts.mls_web_search_system_prompt()},
-                {"role": "user", "content": user_prompt},
-            ],
-            "tools": [{"type": "web_search"}],
-            "text": _schema_to_text_config(get_mls_web_search_schema()),
-        }
-        if _can_set_temperature(model_name, 0.2):
-            request_args["temperature"] = 0.2
-
-        resp = client.responses.create(**request_args)
-        raw_text = _response_output_text(resp)
-        try:
-            parsed = _parse_json_from_text(raw_text)
-        except Exception as inner_exc:
-            log.debug("Raw MLS search response text: %s", raw_text)
-            raise ValueError("Failed to parse MLS search JSON payload") from inner_exc
-        if not isinstance(parsed, dict):
-            raise ValueError("MLS search response payload is not an object")
-        return parsed
+    except Exception as exc:  # pragma: no cover
+        log.exception("MLS web search agent run failed", exc_info=exc)
+        raise RuntimeError("MLS web search failed; please retry later") from exc
 
 
 def search_and_match(session: Session) -> List[MatchItem]:
@@ -1688,38 +1854,59 @@ async def run_enhanced_workflow(workflow_input: WorkflowInput) -> Dict[str, Any]
         
         # Step 1: Run guardrails check
         guardrails_inputtext = user_message
+        sanitized_user_message = user_message
+
+        local_guardrail_output = run_local_guardrail_check(user_message)
+        if local_guardrail_output:
+            return {
+                "session_id": sid,
+                "status": "blocked",
+                "guardrails_output": local_guardrail_output,
+            }
+
         try:
             if _HAS_GUARDRAILS:
+                guardrails_instance = instantiate_guardrails(load_config_bundle(GUARDRAILS_CONFIG))
                 guardrails_result = await run_guardrails(
-                    ctx, 
-                    guardrails_inputtext, 
-                    "text/plain", 
-                    instantiate_guardrails(load_config_bundle(GUARDRAILS_CONFIG)), 
-                    suppress_tripwire=True, 
-                    raise_guardrail_errors=True
+                    ctx,
+                    guardrails_inputtext,
+                    "text/plain",
+                    guardrails_instance,
+                    suppress_tripwire=True,
+                    raise_guardrail_errors=True,
                 )
                 guardrails_hastripwire = guardrails_has_tripwire(guardrails_result)
                 guardrails_anonymizedtext = get_guardrail_checked_text(guardrails_result, guardrails_inputtext)
-                guardrails_output = (guardrails_hastripwire and build_guardrail_fail_output(guardrails_result or [])) or (guardrails_anonymizedtext or guardrails_inputtext)
-                
+                sanitized_user_message = guardrails_anonymizedtext or guardrails_inputtext
+
                 if guardrails_hastripwire:
+                    guardrail_fail_output = build_guardrail_fail_output(guardrails_result or [])
+                    guardrail_fail_output["source"] = "guardrails"
                     return {
                         "session_id": sid,
                         "status": "blocked",
-                        "guardrails_output": guardrails_output
+                        "guardrails_output": guardrail_fail_output,
                     }
             else:
-                # Fallback to basic moderation check
-                guard = jailbreak_check(user_message)
-                if not guard.allowed:
-                    return {
-                        "session_id": sid,
-                        "status": "blocked",
-                        "reason": "Guardrails/Jailbreak check failed",
-                        "details": guard.reasons,
-                    }
+                log.debug("Guardrails library not available; skipping guardrail check")
         except Exception as exc:
             log.warning("Guardrails check failed, proceeding without guardrails: %s", exc)
+
+        guardrails_inputtext = sanitized_user_message
+
+        if sanitized_user_message != user_message and conversation_history:
+            try:
+                conversation_history[-1]["content"][0]["text"] = sanitized_user_message
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+
+        moderation_fail_output = await run_moderation_check(guardrails_inputtext)
+        if moderation_fail_output:
+            return {
+                "session_id": sid,
+                "status": "blocked",
+                "guardrails_output": moderation_fail_output,
+            }
         
         # Step 2: Run router with conversation history context
         router_input = [
@@ -2098,7 +2285,6 @@ def reset_session(session_id: Optional[str] = None) -> Dict[str, Any]:
 __all__ = [
     "AsyncOpenAI",
     "FastMCP",
-    "GuardrailResult",
     "IntakeState",
     "MatchItem",
     "QAFile",
@@ -2115,7 +2301,6 @@ __all__ = [
     "health",
     "intake_is_complete",
     "intake_step",
-    "jailbreak_check",
     "llm_json",
     "mcp",
     "negotiation_coach_tool",
