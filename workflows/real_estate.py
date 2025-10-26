@@ -57,6 +57,7 @@ from schemas import (
     get_required_intake_fields,
     get_router_json_schema,
     get_tour_plan_extraction_schema,
+    get_tour_plan_generation_schema,
 )
 
 # Load environment variables from .env file once at module import time.
@@ -82,6 +83,17 @@ if not log.handlers:
 # ---------------------------------------------------------------------------
 client = OpenAI()
 JSON_DECODER = json.JSONDecoder()
+
+
+def _can_set_temperature(model: str, temperature: Optional[float]) -> bool:
+    """Return True if the model supports an explicit temperature override."""
+
+    if temperature is None:
+        return False
+    model_lower = model.lower()
+    if model_lower.startswith("gpt-5"):
+        return False
+    return True
 
 try:  # Guardrails import is optional at runtime
     from openai_guardrails.runtime import (  # type: ignore
@@ -146,19 +158,22 @@ def llm_json(
     user_prompt: str,
     json_schema: Dict[str, Any],
     model: str = "gpt-4o-mini",
-    temperature: float = 0.1,
+    temperature: Optional[float] = 0.2,
 ) -> Dict[str, Any]:
     """Call the Chat Completions API and coerce the response to JSON."""
 
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
+    request_args: Dict[str, Any] = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_schema", "json_schema": json_schema},
-    )
+        "response_format": {"type": "json_schema", "json_schema": json_schema},
+    }
+    if _can_set_temperature(model, temperature):
+        request_args["temperature"] = temperature
+
+    resp = client.chat.completions.create(**request_args)
     try:
         text = resp.choices[0].message.content
         return json.loads(text)
@@ -510,16 +525,20 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
     ]
     user_prompt = prompts.mls_web_search_user_prompt(MLS_SEARCH_DOMAINS, criteria_lines)
 
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
+    model_name = "gpt-4o-mini"
+    request_args: Dict[str, Any] = {
+        "model": model_name,
+        "input": [
             {"role": "system", "content": prompts.mls_web_search_system_prompt()},
             {"role": "user", "content": user_prompt},
         ],
-        tools=[{"type": "web_search"}],
-        temperature=0.2,
-        text=_schema_to_text_config(get_mls_web_search_schema()),
-    )
+        "tools": [{"type": "web_search"}],
+        "text": _schema_to_text_config(get_mls_web_search_schema()),
+    }
+    if _can_set_temperature(model_name, 0.2):
+        request_args["temperature"] = 0.2
+
+    resp = client.responses.create(**request_args)
     raw_text = _response_output_text(resp)
     try:
         parsed = _parse_json_from_text(raw_text)
@@ -680,14 +699,17 @@ def _sanitize_open_houses(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List
             continue
         address_raw = item.get("address")
         address = str(address_raw).strip() if address_raw is not None else ""
-        slots_raw = item.get("slots") or []
-        if not isinstance(slots_raw, list):
+        raw_slots = item.get("slots")
+        if raw_slots in (None, ""):
+            raw_slots = []
+        if not isinstance(raw_slots, list):
             issues.append(
-                f"Ignored slots for {address or item!r}; expected list, got {type(slots_raw).__name__}"
+                f"Ignored slots for {address or item!r}; expected list, got {type(raw_slots).__name__}"
             )
-            slots_raw = []
+            raw_slots = []
+
         slots: List[Dict[str, str]] = []
-        for slot in slots_raw:
+        for slot in raw_slots:
             if not isinstance(slot, dict):
                 issues.append(f"Ignored slot entry; expected object, got {type(slot).__name__}: {slot!r}")
                 continue
@@ -699,15 +721,18 @@ def _sanitize_open_houses(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List
                 issues.append(
                     f"Ignored slot for {address or item!r}; unable to parse times {slot.get('start')!r}, {slot.get('end')!r}"
                 )
-        if address and slots:
-            pid_raw = item.get("property_id")
-            pid = str(pid_raw).strip() if pid_raw not in (None, "") else None
-            sanitized.append({"property_id": pid, "address": address, "slots": slots})
-        else:
-            if not address:
-                issues.append(f"Open house missing address: {item!r}")
-            if not slots:
-                issues.append(f"Open house missing valid slots for {address or item!r}")
+
+        if not address:
+            issues.append(f"Open house missing address: {item!r}")
+            continue
+
+        pid_raw = item.get("property_id")
+        pid = str(pid_raw).strip() if pid_raw not in (None, "") else None
+        sanitized.append({"property_id": pid, "address": address, "slots": slots})
+        if not slots:
+            issues.append(
+                f"Open house for {address} has no usable time slots; keeping property with an empty slot list."
+            )
     return sanitized, issues
 
 
@@ -731,13 +756,16 @@ def _sanitize_windows(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dic
     return windows, issues
 
 
-def plan_tours(inp: TourInput) -> Dict[str, Any]:
-    visit_minutes = 30
-    travel_minutes = 20
+def _plan_tours_rule_based(
+    inp: TourInput, *, visit_minutes: int = 30, travel_minutes: int = 20
+) -> Dict[str, Any]:
 
     slot_entries: List[Dict[str, Any]] = []
+    missing_slot_addresses: List[str] = []
     for open_house in inp.open_houses:
         prop_id = open_house.get("property_id") or f"addr:{open_house['address']}"
+        if not open_house.get("slots"):
+            missing_slot_addresses.append(open_house["address"])
         for slot in open_house.get("slots", []):
             slot_entries.append(
                 {
@@ -763,11 +791,21 @@ def plan_tours(inp: TourInput) -> Dict[str, Any]:
         f"Cataloged {len(inp.open_houses)} properties with {len(slot_entries)} normalized open house slots.",
         f"Mapped {len(window_entries)} preferred windows totaling {coverage_minutes} minutes of availability to align with 30-minute visits and {travel_minutes}-minute buffers.",
     ]
+    if missing_slot_addresses:
+        addressed = ", ".join(sorted(set(missing_slot_addresses)))
+        house_reasoning.append(
+            f"No published open house times for {addressed}; plan includes outreach steps for private showings or virtual walk-throughs."
+        )
 
     property_index: Dict[str, Dict[str, Any]] = {}
     for open_house in inp.open_houses:
         prop_id = open_house.get("property_id") or f"addr:{open_house['address']}"
-        property_index[prop_id] = {"address": open_house["address"], "scheduled": False, "feasible_windows": []}
+        property_index[prop_id] = {
+            "address": open_house["address"],
+            "scheduled": False,
+            "feasible_windows": [],
+            "has_slots": bool(open_house.get("slots")),
+        }
 
     for window in window_entries:
         overlaps: List[str] = []
@@ -863,7 +901,11 @@ def plan_tours(inp: TourInput) -> Dict[str, Any]:
     for property_id, details in property_index.items():
         if not details["scheduled"]:
             feasible = sorted(set(details["feasible_windows"]))
-            if feasible:
+            if not details["has_slots"]:
+                unscheduled_details.append(
+                    f"{details['address']} lacked published open house slots; coordinate directly with the listing agent for times or arrange a private showing/virtual tour."
+                )
+            elif feasible:
                 unscheduled_details.append(
                     f"{details['address']} remained unscheduled because other commitments consumed matching windows ({', '.join(feasible)})."
                 )
@@ -877,14 +919,32 @@ def plan_tours(inp: TourInput) -> Dict[str, Any]:
         house_reasoning.append("All candidate properties received confirmed visits within preferred windows while preserving travel buffers.")
 
     if not schedule:
-        house_reasoning.append("No feasible visits landed within the provided windows after enforcing duration and travel constraints.")
+        if missing_slot_addresses:
+            house_reasoning.append(
+                "No feasible visits landed because several properties lacked confirmed viewing slots; proposing outreach-driven follow-ups."
+            )
+        else:
+            house_reasoning.append(
+                "No feasible visits landed within the provided windows after enforcing duration and travel constraints."
+            )
+
+    travel_guidance = f"Maintain at least {travel_minutes} minutes for travel; extend buffers if traffic forecasts worsen."
+    if missing_slot_addresses:
+        travel_guidance += " Confirm availability with listing teams for properties without published slots and insert times once secured."
+
+    if schedule:
+        summary_text = f"Planned {len(schedule)} visit(s) across {len(inp.open_houses)} properties."
+    elif missing_slot_addresses:
+        summary_text = (
+            "No visits scheduled yet because open house slots were unavailable; reach out for times, propose private previews, or schedule virtual tours."
+        )
+    else:
+        summary_text = "No feasible schedule generated; consider expanding preferred windows or requesting alternate open house slots."
 
     final_schedule = {
         "visits": schedule,
-        "travel_guidance": f"Maintain at least {travel_minutes} minutes for travel; extend buffers if traffic forecasts worsen.",
-        "summary": f"Planned {len(schedule)} visit(s) across {len(inp.open_houses)} properties."
-        if schedule
-        else "No feasible schedule generated; consider expanding preferred windows or requesting alternate open house slots.",
+        "travel_guidance": travel_guidance,
+        "summary": summary_text,
     }
 
     calendar_reasoning = [
@@ -941,6 +1001,32 @@ def plan_tours(inp: TourInput) -> Dict[str, Any]:
             "final_recommendation": "Deliver post-tour micro-surveys within 24h and feed results into the CRM analytics layer to inform follow-ups and search refinement.",
         },
     }
+
+
+def plan_tours(inp: TourInput) -> Dict[str, Any]:
+    visit_minutes = 30
+    travel_minutes = 20
+    user_prompt = prompts.tour_plan_planner_user_prompt(
+        inp.open_houses,
+        inp.preferred_windows,
+        visit_minutes=visit_minutes,
+        travel_minutes=travel_minutes,
+    )
+    try:
+        return llm_json(
+            system_prompt=prompts.tour_plan_planner_system_prompt(),
+            user_prompt=user_prompt,
+            json_schema=get_tour_plan_generation_schema(),
+            model="gpt-4o-mini",
+            temperature=0.2,
+        )
+    except Exception as exc:  # pragma: no cover
+        log.warning("Tour plan LLM failed, falling back to rule-based planner: %s", exc)
+        return _plan_tours_rule_based(
+            inp,
+            visit_minutes=visit_minutes,
+            travel_minutes=travel_minutes,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1088,23 +1174,39 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
             next_node = "tour_plan_tool"
             try:
                 match_objs = search_and_match(session)
-                next_step_result = {
-                    "step": "search_and_match",
-                    "matches": [match.model_dump() for match in match_objs],
-                    "open_houses": [
-                        {
-                            "property_id": match.property_id,
-                            "address": match.address,
-                            "slots": match.open_house_slots,
-                        }
-                        for match in match_objs
-                        if match.open_house_slots
-                    ],
-                    "count": len(match_objs),
-                    "next_node": "tour_plan_tool",
-                    "message": "Review the recommended properties and proceed with tour planning using the provided open house slots.",
-                }
-                result["auto_executed_next_step"] = True
+                matches_payload = [match.model_dump() for match in match_objs]
+                open_house_payload = [
+                    {
+                        "property_id": match.property_id,
+                        "address": match.address,
+                        "slots": match.open_house_slots,
+                    }
+                    for match in match_objs
+                ]
+                match_count = len(matches_payload)
+
+                if match_count == 0:
+                    next_node = "search_and_match_tool"
+                    next_step_result = {
+                        "step": "search_and_match",
+                        "matches": matches_payload,
+                        "open_houses": open_house_payload,
+                        "count": match_count,
+                        "message": "No matching properties were found with the current criteria. Adjust your preferences or try again shortly.",
+                        "next_node": "search_and_match_tool",
+                    }
+                    result["auto_executed_next_step"] = True
+                else:
+                    next_node = "tour_plan_tool"
+                    next_step_result = {
+                        "step": "search_and_match",
+                        "matches": matches_payload,
+                        "open_houses": open_house_payload,
+                        "count": match_count,
+                        "next_node": "tour_plan_tool",
+                        "message": "Review the recommended properties and proceed with tour planning using available open house slots or queue creative follow-ups where times are missing.",
+                    }
+                    result["auto_executed_next_step"] = True
             except Exception as exc:
                 log.exception("Failed to auto-execute search_and_match: %s", exc)
                 next_step_result = {
@@ -1148,19 +1250,33 @@ def search_and_match_tool(session_id: Optional[str] = None) -> Dict[str, Any]:
             "next_node": "search_and_match_tool",
         }
 
+    open_houses = [
+        {"property_id": item.property_id, "address": item.address, "slots": item.open_house_slots}
+        for item in match_objs
+    ]
+    match_count = len(matches)
+
+    if match_count == 0:
+        return {
+            "session_id": sid,
+            "status": "ok",
+            "step": "search_and_match",
+            "matches": matches,
+            "open_houses": open_houses,
+            "count": match_count,
+            "next_node": "search_and_match_tool",
+            "message": "No matching properties were found with the current criteria. Update the preferences or retry in a bit.",
+        }
+
     return {
         "session_id": sid,
         "status": "ok",
         "step": "search_and_match",
         "matches": matches,
-        "open_houses": [
-            {"property_id": item.property_id, "address": item.address, "slots": item.open_house_slots}
-            for item in match_objs
-            if item.open_house_slots
-        ],
-        "count": len(matches),
+        "open_houses": open_houses,
+        "count": match_count,
         "next_node": "tour_plan_tool",
-        "message": "Provide open house options and preferred windows to plan tours.",
+        "message": "Provide open house options and preferred windows to plan tours, noting any listings that need creative scheduling follow-ups due to missing slots.",
     }
 
 
