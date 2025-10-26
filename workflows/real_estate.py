@@ -641,22 +641,79 @@ def _normalize_time_string(raw: Any) -> Optional[str]:
     text = str(raw).strip().lower()
     if not text:
         return None
-    text = text.replace(".", ":")
-    text = re.sub(r"\s+", "", text)
 
-    match = re.match(r"^(\d{1,2})(?:[:]?(\d{2}))?(am|pm)$", text)
+    text = text.replace(".", ":")
+    text = text.replace("noon", "12:00pm")
+    text = text.replace("midnight", "12:00am")
+    text = text.replace("–", " ")
+    text = text.replace("—", " ")
+    text = re.sub(r"[,-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Remove common day/month prefixes so formats like "Sat 1:00 PM" parse cleanly.
+    day_month_tokens = {
+        "sun",
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "may",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "sept",
+        "oct",
+        "nov",
+        "dec",
+        "january",
+        "february",
+        "march",
+        "april",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    }
+    tokens: List[str] = []
+    for part in text.split():
+        if part in day_month_tokens:
+            continue
+        tokens.append(part)
+    text = " ".join(tokens)
+
+    match = re.search(r"(\d{1,2})(?:[:](\d{2}))?\s*(am|pm)", text)
     if match:
         hour = int(match.group(1))
         minute = int(match.group(2)) if match.group(2) else 0
+        meridiem = match.group(3)
         if hour == 12:
-            hour = 0 if match.group(3) == "am" else 12
-        elif match.group(3) == "pm":
+            hour = 0 if meridiem == "am" else 12
+        elif meridiem == "pm":
             hour += 12
         if 0 <= hour < 24 and 0 <= minute < 60:
             return f"{hour:02d}:{minute:02d}"
         return None
 
-    match = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    match = re.search(r"(\d{1,2}):(\d{2})", text)
     if match:
         hour = int(match.group(1))
         minute = int(match.group(2))
@@ -664,6 +721,9 @@ def _normalize_time_string(raw: Any) -> Optional[str]:
             return f"{hour:02d}:{minute:02d}"
         return None
 
+    digits_only = re.sub(r"\D", "", text)
+    if digits_only.isdigit():
+        text = digits_only
     if text.isdigit():
         hour = 0
         minute = 0
