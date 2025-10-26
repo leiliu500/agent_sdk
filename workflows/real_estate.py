@@ -9,7 +9,7 @@ Features
 - Router (buy | sell | disclosures | offer | general) with JSON schema
 - Buyer Agent with sub-agents:
     * Buyer-Intake (stepwise, no repeat questions; persistent per session)
-        * Search & Match (live MLS web search via Zillow/Redfin/MLSListings + payment estimate)
+    * Search & Match (live MLS web search via Zillow/Redfin/MLSListings + payment estimate)
     * Tour Plan (open-house schedule optimizer)
     * Disclosure Q&A (file-based Q&A with sentence-level citations)
     * Offer Drafter (compliant draft + checklist)
@@ -734,82 +734,213 @@ def _sanitize_windows(entries: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dic
 def plan_tours(inp: TourInput) -> Dict[str, Any]:
     visit_minutes = 30
     travel_minutes = 20
-    reasoning: List[str] = [
-        "Collected open house slots and user preferred windows.",
-        "Use greedy selection to fit 30-minute visits with 20-minute travel buffers.",
-    ]
-    schedule: List[Dict[str, Any]] = []
 
-    slots = []
+    slot_entries: List[Dict[str, Any]] = []
     for open_house in inp.open_houses:
+        prop_id = open_house.get("property_id") or f"addr:{open_house['address']}"
         for slot in open_house.get("slots", []):
-            slots.append({"property_id": open_house["property_id"], "address": open_house["address"], **slot})
-
-    for window in inp.preferred_windows:
-        start = _time_to_minutes(window["start"])
-        end = _time_to_minutes(window["end"])
-        current_time = start
-        while current_time + visit_minutes <= end:
-            chosen = None
-            for slot in slots:
-                slot_start = _time_to_minutes(slot["start"])
-                slot_end = _time_to_minutes(slot["end"])
-                if slot_start <= current_time and current_time + visit_minutes <= slot_end:
-                    chosen = slot
-                    break
-            if not chosen:
-                current_time += 10
-                continue
-            schedule.append(
+            slot_entries.append(
                 {
-                    "property_id": chosen["property_id"],
-                    "address": chosen["address"],
+                    "property_id": prop_id,
+                    "address": open_house["address"],
+                    "start": slot["start"],
+                    "end": slot["end"],
+                    "start_min": _time_to_minutes(slot["start"]),
+                    "end_min": _time_to_minutes(slot["end"]),
+                }
+            )
+    slot_entries.sort(key=lambda item: (item["start_min"], item["address"]))
+
+    window_entries: List[Dict[str, Any]] = []
+    for window in inp.preferred_windows:
+        start_min = _time_to_minutes(window["start"])
+        end_min = _time_to_minutes(window["end"])
+        window_entries.append({"start": window["start"], "end": window["end"], "start_min": start_min, "end_min": end_min})
+    window_entries.sort(key=lambda item: item["start_min"])
+
+    coverage_minutes = sum(max(0, item["end_min"] - item["start_min"]) for item in window_entries)
+    house_reasoning: List[str] = [
+        f"Cataloged {len(inp.open_houses)} properties with {len(slot_entries)} normalized open house slots.",
+        f"Mapped {len(window_entries)} preferred windows totaling {coverage_minutes} minutes of availability to align with 30-minute visits and {travel_minutes}-minute buffers.",
+    ]
+
+    property_index: Dict[str, Dict[str, Any]] = {}
+    for open_house in inp.open_houses:
+        prop_id = open_house.get("property_id") or f"addr:{open_house['address']}"
+        property_index[prop_id] = {"address": open_house["address"], "scheduled": False, "feasible_windows": []}
+
+    for window in window_entries:
+        overlaps: List[str] = []
+        for slot in slot_entries:
+            overlap_start = max(window["start_min"], slot["start_min"])
+            overlap_end = min(window["end_min"], slot["end_min"])
+            if overlap_start + visit_minutes <= overlap_end:
+                overlaps.append(f"{slot['address']} {slot['start']}-{slot['end']}")
+                prop = property_index.get(slot["property_id"])
+                if prop is not None:
+                    prop["feasible_windows"].append(f"{window['start']}-{window['end']}")
+        if overlaps:
+            joined = "; ".join(sorted(set(overlaps)))
+            house_reasoning.append(
+                f"Window {window['start']}-{window['end']} supports {len(overlaps)} candidate visit block(s): {joined}."
+            )
+        else:
+            house_reasoning.append(
+                f"Window {window['start']}-{window['end']} has no slots wide enough to host a 30-minute visit plus travel buffer considerations."
+            )
+
+    schedule: List[Dict[str, Any]] = []
+    used_slots: set = set()
+    for window in window_entries:
+        current_time = window["start_min"]
+        while current_time + visit_minutes <= window["end_min"]:
+            feasible_slots = [
+                slot
+                for slot in slot_entries
+                if (slot["property_id"], slot["start"], slot["end"]) not in used_slots
+                and slot["start_min"] <= current_time
+                and current_time + visit_minutes <= slot["end_min"]
+            ]
+            if feasible_slots:
+                chosen_slot = min(feasible_slots, key=lambda item: (item["end_min"], item["start_min"]))
+                visit_block = {
+                    "property_id": chosen_slot["property_id"],
+                    "address": chosen_slot["address"],
                     "visit": {
                         "start": _minutes_to_time(current_time),
                         "end": _minutes_to_time(current_time + visit_minutes),
                     },
                     "travel_buffer": f"{travel_minutes}min",
                 }
-            )
-            current_time += visit_minutes + travel_minutes
-    reasoning.append("Sequenced tours to minimize gaps while respecting windows and slot bounds.")
+                schedule.append(visit_block)
+                used_slots.add((chosen_slot["property_id"], chosen_slot["start"], chosen_slot["end"]))
+                prop = property_index.get(chosen_slot["property_id"])
+                if prop is not None:
+                    prop["scheduled"] = True
+                current_time += visit_minutes + travel_minutes
+                continue
 
-    final = {
+            upcoming_slots = [
+                slot
+                for slot in slot_entries
+                if (slot["property_id"], slot["start"], slot["end"]) not in used_slots
+                and slot["start_min"] > current_time
+                and slot["start_min"] + visit_minutes <= window["end_min"]
+            ]
+            if not upcoming_slots:
+                current_time += 10
+                continue
+            next_slot = min(upcoming_slots, key=lambda item: item["start_min"])
+            current_time = max(current_time + 10, next_slot["start_min"])
+
+    schedule.sort(key=lambda item: item["visit"]["start"])
+
+    previous_end: Optional[int] = None
+    for block in schedule:
+        start_min = _time_to_minutes(block["visit"]["start"])
+        end_min = _time_to_minutes(block["visit"]["end"])
+        window_hit = next(
+            (f"{window['start']}-{window['end']}" for window in window_entries if window["start_min"] <= start_min and end_min <= window["end_min"]),
+            None,
+        )
+        if previous_end is None:
+            house_reasoning.append(
+                f"Scheduled {block['address']} from {block['visit']['start']} to {block['visit']['end']} within preferred window {window_hit} to anchor the day."
+            )
+        else:
+            gap = start_min - previous_end
+            if gap >= travel_minutes:
+                house_reasoning.append(
+                    f"Planned {block['address']} at {block['visit']['start']}-{block['visit']['end']} leaving {gap} minutes between visits for travel (needs {travel_minutes})."
+                )
+            else:
+                house_reasoning.append(
+                    f"WARNING: {block['address']} at {block['visit']['start']} compresses travel buffer to {gap} minutes; investigate ride-share or adjust slot."
+                )
+        previous_end = end_min
+
+    unscheduled_details: List[str] = []
+    for property_id, details in property_index.items():
+        if not details["scheduled"]:
+            feasible = sorted(set(details["feasible_windows"]))
+            if feasible:
+                unscheduled_details.append(
+                    f"{details['address']} remained unscheduled because other commitments consumed matching windows ({', '.join(feasible)})."
+                )
+            else:
+                unscheduled_details.append(
+                    f"{details['address']} remained unscheduled because no preferred windows overlapped sufficiently with its slots."
+                )
+    if unscheduled_details:
+        house_reasoning.append("Unscheduled properties: " + " ".join(unscheduled_details))
+    else:
+        house_reasoning.append("All candidate properties received confirmed visits within preferred windows while preserving travel buffers.")
+
+    if not schedule:
+        house_reasoning.append("No feasible visits landed within the provided windows after enforcing duration and travel constraints.")
+
+    final_schedule = {
+        "visits": schedule,
+        "travel_guidance": f"Maintain at least {travel_minutes} minutes for travel; extend buffers if traffic forecasts worsen.",
+        "summary": f"Planned {len(schedule)} visit(s) across {len(inp.open_houses)} properties."
+        if schedule
+        else "No feasible schedule generated; consider expanding preferred windows or requesting alternate open house slots.",
+    }
+
+    calendar_reasoning = [
+        "Map normalized tour data (addresses, slots, travel buffers) to calendar event payloads with explicit time zones.",
+        "Select calendar providers (Google, Outlook) and register OAuth 2.0 client credentials to obtain user-granted tokens.",
+        "Create events with structured descriptions (property details, contact info, travel guidance) and attach buffer blocks for commute segments.",
+        "Subscribe to change notifications or use incremental sync to detect external edits and reconcile conflicts before overwriting user changes.",
+        "Implement token refresh, retry with exponential backoff, and granular permissions revocation handling to keep integrations resilient.",
+    ]
+
+    route_reasoning = [
+        "Accept bulk tour inputs via CSV/API containing property coordinates, slot windows, visit durations, and travel estimates.",
+        "Geocode addresses and build distance matrices using mapping APIs, caching results to control quota usage.",
+        "Model the problem as a vehicle routing problem with time windows (VRPTW) capturing visit durations and allowable arrival ranges.",
+        "Run an optimization engine (e.g., OR-Tools CP-SAT) with constraints for maximum daily drive time, preferred start/end anchors, and optional priorities.",
+        "Return optimized sequences with slack indicators so dispatchers can tweak manually and re-run scenarios quickly.",
+    ]
+
+    confirmation_reasoning = [
+        "Consolidate participant preferences (SMS, email) along with backup contact channels for contingencies.",
+        "Generate confirmation messages immediately after scheduling, embedding itinerary summaries, agent contacts, and property highlights.",
+        "Schedule reminders at logical intervals (24 hours, 3 hours, and 30 minutes prior) while accounting for time zone shifts and daylight savings.",
+        "Include dynamic update links so participants can acknowledge, request changes, or report delays in real time.",
+        "Track delivery and engagement metrics to escalate follow-ups if acknowledgements are missing before critical milestones.",
+    ]
+
+    feedback_reasoning = [
+        "Define concise surveys per property focusing on fit, condition, value, and qualitative notes.",
+        "Trigger feedback requests within 12-24 hours of each visit via preferred channels to capture impressions while fresh.",
+        "Provide mobile-friendly response formats and allow quick voice-to-text notes for on-the-go agents.",
+        "Aggregate results into a centralized CRM or analytics dashboard with tagging by property and buyer sentiment trends.",
+        "Loop insights back into search criteria refinement and follow-up communication with listing agents.",
+    ]
+
+    return {
         "house_visit_schedule": {
-            "reasoning_steps": reasoning,
-            "final_recommendation": schedule,
+            "reasoning_steps": house_reasoning,
+            "final_recommendation": final_schedule,
         },
         "calendar_integration": {
-            "reasoning_steps": [
-                "Use Google/Outlook Calendar APIs with OAuth2 (user grant).",
-                "Create events with travel buffers; set reminders at 24h and 1h.",
-                "Handle edits via webhook push (watch) to resync changes.",
-            ],
-            "final_recommendation": "Implement bi-directional sync with conflict detection and retry on 409s.",
+            "reasoning_steps": calendar_reasoning,
+            "final_recommendation": "Integrate with Google and Outlook calendars via OAuth 2.0, pushing events with travel buffers and reconciling updates through webhook-backed sync pipelines.",
         },
         "route_optimization": {
-            "reasoning_steps": [
-                "Treat as VRP with time windows (visit duration 30, travel 20).",
-                "For more than ~8 stops, use OR-Tools (CP-SAT) or external service.",
-            ],
-            "final_recommendation": "Use OR-Tools with time-window constraints; fall back to greedy for small N.",
+            "reasoning_steps": route_reasoning,
+            "final_recommendation": "Adopt a VRPTW solver (e.g., OR-Tools CP-SAT) fed by cached distance matrices to produce optimized multi-stop tour routes with manual override support.",
         },
         "confirmation_and_reminders": {
-            "reasoning_steps": [
-                "Send booking confirmation immediately (email+SMS).",
-                "Reminders at T-24h and T-1h; include route link and parking notes.",
-            ],
-            "final_recommendation": "Automate via your comms service (SES/Twilio) with iCal attachments.",
+            "reasoning_steps": confirmation_reasoning,
+            "final_recommendation": "Automate confirmations immediately after booking and dispatch reminders at 24h, 3h, and 30m intervals with actionable update links.",
         },
         "feedback_capture": {
-            "reasoning_steps": [
-                "Send post-tour survey per house within 24h.",
-                "Aggregate ratings (1-5) for fit, condition, value; collect notes.",
-            ],
-            "final_recommendation": "Store feedback in your CRM and surface a summary to agents/clients.",
+            "reasoning_steps": feedback_reasoning,
+            "final_recommendation": "Deliver post-tour micro-surveys within 24h and feed results into the CRM analytics layer to inform follow-ups and search refinement.",
         },
     }
-    return final
 
 
 # ---------------------------------------------------------------------------
