@@ -1,9 +1,8 @@
 fastmcp
 openai
-openai-agents
+openai-agents>=0.4.0
 pydantic
 python-dotenv
-agents
 fastapi
 uvicorn[standard]
 requests

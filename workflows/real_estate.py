@@ -143,6 +143,7 @@ class Session:
     history: List[Dict[str, Any]] = field(default_factory=list)
     intake: IntakeState = field(default_factory=IntakeState)
     agent_items: List[Dict[str, Any]] = field(default_factory=list)
+    intake_agent_items: List[Dict[str, Any]] = field(default_factory=list)
 
 
 SESSIONS: Dict[str, Session] = {}
@@ -290,6 +291,46 @@ class ListingModel(BaseModel):
 class MLSWebSearchResult(BaseModel):
     search_queries: List[SearchQueryModel]
     listings: List[ListingModel]
+
+
+class IntakeSlotsModel(BaseModel):
+    budget: Optional[str] = None
+    locations: Optional[str] = None
+    home_type: Optional[str] = None
+    bedrooms: Optional[str] = None
+    bathrooms: Optional[str] = None
+    financing_status: Optional[str] = None
+    timeline: Optional[str] = None
+    must_haves: Optional[str] = None
+    deal_breakers: Optional[str] = None
+    consents: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Optional[str]]:
+        return self.model_dump()
+
+
+class IntakeAgentOutput(BaseModel):
+    status: Literal["ask", "summary", "confirmed"]
+    message: str
+    field: Optional[str] = None
+    next_field: Optional[str] = None
+    slots: IntakeSlotsModel = Field(default_factory=IntakeSlotsModel)
+    summary: Optional[Dict[str, Optional[str]]] = None
+
+    @model_validator(mode="after")
+    def _validate_next_field(self) -> "IntakeAgentOutput":
+        allowed = set(get_required_intake_fields()) | {"done", None}
+        if self.next_field not in allowed:
+            self.next_field = None
+        if self.status == "ask" and not self.field:
+            self.field = self.next_field
+        if self.status in {"summary", "confirmed"} and self.summary is None:
+            self.summary = {
+                key: value
+                for key, value in self.slots.as_dict().items()
+                if value not in (None, "")
+            }
+        return self
 
 
 def _default_reasoning_settings() -> ModelSettings:
@@ -449,7 +490,7 @@ def _sync_next_field(intake: IntakeState) -> None:
     intake.next_field = "done"
 
 
-def _extract_intake_fields(message: str) -> Dict[str, Any]:
+def _legacy_extract_intake_fields(message: str) -> Dict[str, Any]:
     if not message or not message.strip():
         return {}
     return llm_json(
@@ -459,7 +500,7 @@ def _extract_intake_fields(message: str) -> Dict[str, Any]:
     )
 
 
-def _ingest_intake_message(
+def _legacy_ingest_intake_message(
     session: Session,
     user_message: Optional[str],
     slot_hints: Optional[Dict[str, Any]] = None,
@@ -492,7 +533,7 @@ def _ingest_intake_message(
 
     if user_message and user_message.strip():
         try:
-            extracted = _extract_intake_fields(user_message)
+            extracted = _legacy_extract_intake_fields(user_message)
         except Exception as exc:  # pragma: no cover
             log.warning("Intake extraction failed; falling back to direct assignment: %s", exc)
             extracted = {}
@@ -508,12 +549,12 @@ def _ingest_intake_message(
     _sync_next_field(intake)
 
 
-def intake_step(
+def _legacy_intake_step(
     session: Session,
     user_message: Optional[str],
     slot_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    _ingest_intake_message(session, user_message, slot_hints)
+    _legacy_ingest_intake_message(session, user_message, slot_hints)
     state = session.intake
     required_fields = get_required_intake_fields()
 
@@ -538,6 +579,140 @@ def intake_step(
         "field": state.next_field,
         "message": next_q if not context else f"{context}.\n{next_q}",
     }
+
+
+def _set_intake_field(intake: IntakeState, field: str, value: Any, *, force: bool = False) -> bool:
+    if field not in get_required_intake_fields():
+        return False
+    if value in (None, ""):
+        if force and getattr(intake, field) not in (None, ""):
+            setattr(intake, field, None)
+            return True
+        return False
+    norm = _normalize_intake_value(field, value)
+    if norm is None:
+        if force and getattr(intake, field) not in (None, ""):
+            setattr(intake, field, None)
+            return True
+        return False
+    current = getattr(intake, field)
+    if current == norm:
+        return False
+    if current in (None, "") or force or current != norm:
+        setattr(intake, field, norm)
+        return True
+    return False
+
+
+def _intake_state_snapshot(intake: IntakeState) -> Dict[str, Optional[str]]:
+    return {key: getattr(intake, key) for key in get_required_intake_fields()}
+
+
+def _apply_slot_hints(intake: IntakeState, slot_hints: Optional[Dict[str, Any]]) -> None:
+    if not slot_hints:
+        return
+    slot_map = {
+        "budget": slot_hints.get("budget"),
+        "locations": slot_hints.get("areas"),
+        "timeline": slot_hints.get("timing"),
+    }
+    updated = False
+    for field, value in slot_map.items():
+        if value not in (None, ""):
+            if _set_intake_field(intake, field, value, force=True):
+                updated = True
+    if updated:
+        _sync_next_field(intake)
+
+
+def _build_intake_agent_input(
+    session: Session,
+    user_message: Optional[str],
+    slot_hints: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    items = list(session.intake_agent_items)
+    context_payload = {
+        "current_state": _intake_state_snapshot(session.intake),
+        "next_field": session.intake.next_field,
+        "slot_hints": slot_hints or {},
+    }
+    context_text = json.dumps(context_payload, ensure_ascii=True)
+    content_blocks: List[Dict[str, str]] = [{"type": "input_text", "text": f"CONTEXT:\n{context_text}"}]
+    if user_message is not None:
+        content_blocks.append({"type": "input_text", "text": f"USER_MESSAGE:\n{user_message}"})
+    else:
+        content_blocks.append({"type": "input_text", "text": "USER_MESSAGE:\n"})
+    items.append({"role": "user", "content": content_blocks})
+    return items
+
+
+def _update_intake_state_from_slots(intake: IntakeState, slots: IntakeSlotsModel) -> None:
+    updated = False
+    for field, value in slots.as_dict().items():
+        if _set_intake_field(intake, field, value, force=True):
+            updated = True
+    if updated:
+        _sync_next_field(intake)
+
+
+def intake_step(
+    session: Session,
+    user_message: Optional[str],
+    slot_hints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    intake = session.intake
+    _apply_slot_hints(intake, slot_hints)
+    _sync_next_field(intake)
+    agent_input = _build_intake_agent_input(session, user_message, slot_hints)
+
+    try:
+        with _agent_trace_context("Buyer Intake", INTAKE_AGENT.name):
+            result = _run_agent(INTAKE_AGENT, agent_input)
+    except Exception as exc:  # pragma: no cover - fallback to deterministic flow
+        log.exception("Buyer intake agent run failed; falling back to legacy flow", exc_info=exc)
+        return _legacy_intake_step(session, user_message, slot_hints)
+
+    serialized_history: List[Dict[str, Any]] = []
+    for item in result.to_input_list():
+        if isinstance(item, BaseModel):
+            serialized_history.append(item.model_dump(mode="json", exclude_none=True))
+        else:
+            serialized_history.append(item)
+    session.intake_agent_items = serialized_history[-16:]
+
+    try:
+        agent_output = result.final_output_as(IntakeAgentOutput, raise_if_incorrect_type=True)
+    except Exception as exc:  # pragma: no cover - fallback to deterministic flow
+        log.exception("Buyer intake agent returned invalid output; falling back to legacy flow", exc_info=exc)
+        return _legacy_intake_step(session, user_message, slot_hints)
+
+    _update_intake_state_from_slots(intake, agent_output.slots)
+
+    if agent_output.next_field:
+        intake.next_field = agent_output.next_field
+    else:
+        _sync_next_field(intake)
+
+    summary = agent_output.summary
+    if agent_output.status in {"summary", "confirmed"}:
+        if summary is None:
+            summary = _intake_state_snapshot(intake)
+        else:
+            snapshot = _intake_state_snapshot(intake)
+            summary = {key: summary.get(key) or snapshot.get(key) for key in snapshot}
+
+    response = {
+        "status": agent_output.status,
+        "field": agent_output.field,
+        "message": agent_output.message,
+        "summary": summary,
+        "slots": agent_output.slots.as_dict(),
+        "next_field": intake.next_field,
+    }
+    if response["field"] is None and agent_output.status == "ask":
+        response["field"] = intake.next_field
+
+    return response
 
 
 def intake_is_complete(session: Session) -> bool:
@@ -585,6 +760,15 @@ MLS_SEARCH_AGENT = Agent(
     model="gpt-5",
     tools=[MLS_WEB_SEARCH_TOOL],
     output_type=MLSWebSearchResult,
+    model_settings=_default_reasoning_settings(),
+)
+
+# Buyer intake agent (LLM-managed stepper with structured JSON output)
+INTAKE_AGENT = Agent(
+    name="Buyer Intake",
+    instructions=prompts.intake_agent_system_prompt(),
+    model="gpt-5",
+    output_type=IntakeAgentOutput,
     model_settings=_default_reasoning_settings(),
 )
 
@@ -1461,14 +1645,19 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
     next_node = None
     next_step_result = None
 
-    if done and result.get("status") == "summary":
-        if user_message and user_message.strip().lower() in [
-            "yes",
-            "y",
-            "confirmed",
-            "correct",
-            "confirm",
-        ]:
+    status = (result.get("status") or "").lower()
+    user_confirmed = status == "confirmed"
+    if not user_confirmed and user_message:
+        low = user_message.strip().lower()
+        user_confirmed = low in {"yes", "y", "confirmed", "correct", "confirm"}
+        if user_confirmed and status != "confirmed" and done:
+            result["status"] = "confirmed"
+            status = "confirmed"
+
+    if done and status in {"summary", "confirmed"}:
+        if user_confirmed:
+            if not result.get("summary"):
+                result["summary"] = _intake_state_snapshot(session.intake)
             next_node = "tour_plan_tool"
             try:
                 match_objs = search_and_match(session)
