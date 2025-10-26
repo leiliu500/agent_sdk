@@ -41,12 +41,23 @@ import os
 import re
 import time
 import uuid
+import asyncio
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from queue import Empty, Queue
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from dotenv import load_dotenv
+from agents.agent import Agent
+from agents.model_settings import ModelSettings
+from agents.run import Runner
+from agents.tool import WebSearchTool
+from agents.tracing import agent_span, get_current_trace, trace
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
+from openai.types.responses.web_search_tool_param import UserLocation
+from openai.types.shared import Reasoning
+from pydantic import BaseModel, Field, model_validator
 
 import prompts
 from schemas import (
@@ -131,6 +142,7 @@ class Session:
     last_ts: float
     history: List[Dict[str, Any]] = field(default_factory=list)
     intake: IntakeState = field(default_factory=IntakeState)
+    agent_items: List[Dict[str, Any]] = field(default_factory=list)
 
 
 SESSIONS: Dict[str, Session] = {}
@@ -219,31 +231,183 @@ def jailbreak_check(user_message: str) -> GuardrailResult:
 
 
 # ---------------------------------------------------------------------------
+# Agents SDK configuration
+# ---------------------------------------------------------------------------
+
+
+class RouterSlotsModel(BaseModel):
+    budget: Optional[str] = None
+    areas: Optional[str] = None
+    timing: Optional[str] = None
+    property_ref: Optional[str] = None
+    listing_id: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Optional[str]]:
+        return {key: (value if value not in ("", None) else None) for key, value in self.model_dump().items()}
+
+
+class RouterOutputModel(BaseModel):
+    intent: Literal["buy", "sell", "disclosures", "offer", "general"]
+    confidence: float
+    slots: RouterSlotsModel = Field(default_factory=RouterSlotsModel)
+
+    @model_validator(mode="after")
+    def _clamp_confidence(self) -> "RouterOutputModel":
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        return self
+
+    def slots_as_dict(self) -> Dict[str, Optional[str]]:
+        return self.slots.as_dict()
+
+
+class SearchQueryModel(BaseModel):
+    domain: str
+    query: str
+    result_summary: str
+
+
+class ListingSlotModel(BaseModel):
+    start: str
+    end: str
+
+
+class ListingModel(BaseModel):
+    property_id: Optional[str] = None
+    address: str
+    list_price: Union[str, float, None] = None
+    beds: Optional[Union[str, float]] = None
+    baths: Optional[Union[str, float]] = None
+    source_url: str
+    source_name: Optional[str] = None
+    fit_reasoning: str
+    commute_notes: Optional[str] = None
+    notes: Optional[str] = None
+    open_house_slots: List[ListingSlotModel] = Field(default_factory=list)
+
+
+class MLSWebSearchResult(BaseModel):
+    search_queries: List[SearchQueryModel]
+    listings: List[ListingModel]
+
+
+def _default_reasoning_settings() -> ModelSettings:
+    return ModelSettings(
+        reasoning=Reasoning(effort="low", summary="auto"),
+        store=True,
+    )
+
+
+ROUTER_AGENT = Agent(
+    name="Router",
+    instructions=prompts.router_system_prompt(),
+    model="gpt-5",
+    output_type=RouterOutputModel,
+    model_settings=_default_reasoning_settings(),
+)
+
+
+# ---------------------------------------------------------------------------
 # Router agent
 # ---------------------------------------------------------------------------
 INTAKE_QUESTIONS = prompts.intake_questions()
 
 
 def router_route(user_message: str, session: Session) -> Dict[str, Any]:
-    history_snippets = [
-        f"U:{h['user']}\nA:{h['agent']}" for h in session.history[-4:] if "user" in h and "agent" in h
-    ]
-    history_text = "\n\n".join(history_snippets)
-    user_prompt = prompts.router_user_prompt(history_text=history_text, user_message=user_message)
-    out = llm_json(
-        system_prompt=prompts.router_system_prompt(),
-        user_prompt=user_prompt,
-        json_schema=get_router_json_schema(),
+    input_items: List[Dict[str, Any]] = []
+    for item in session.agent_items:
+        if isinstance(item, BaseModel):
+            input_items.append(item.model_dump(mode="json", exclude_none=True))
+        else:
+            input_items.append(item)
+    input_items.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": user_message,
+                }
+            ],
+        }
     )
-    slots_obj: Dict[str, Any] = {}
+
     try:
-        slots_obj = json.loads(out.get("slots") or "{}")
-    except Exception:
-        slots_obj = {}
-    for key in ["budget", "areas", "timing", "property_ref", "listing_id", "email", "phone"]:
-        slots_obj.setdefault(key, None)
-    out["slots_obj"] = slots_obj
-    return out
+        with _agent_trace_context("Real Estate Router", ROUTER_AGENT.name):
+            result = _run_agent(ROUTER_AGENT, input_items)
+    except Exception as exc:  # pragma: no cover - fallback to legacy flow
+        log.exception("Router agent run failed; falling back to legacy router prompt", exc_info=exc)
+        history_snippets = [
+            f"U:{h['user']}\nA:{h['agent']}" for h in session.history[-4:] if "user" in h and "agent" in h
+        ]
+        history_text = "\n\n".join(history_snippets)
+        user_prompt = prompts.router_user_prompt(history_text=history_text, user_message=user_message)
+        out = llm_json(
+            system_prompt=prompts.router_system_prompt(),
+            user_prompt=user_prompt,
+            json_schema=get_router_json_schema(),
+        )
+        slots_obj: Dict[str, Any] = {}
+        try:
+            slots_obj = json.loads(out.get("slots") or "{}")
+        except Exception:
+            slots_obj = {}
+        for key in ["budget", "areas", "timing", "property_ref", "listing_id", "email", "phone"]:
+            slots_obj.setdefault(key, None)
+        out["slots_obj"] = slots_obj
+
+        fallback_history: List[Dict[str, Any]] = []
+        for item in input_items:
+            if isinstance(item, BaseModel):
+                fallback_history.append(item.model_dump(mode="json", exclude_none=True))
+            else:
+                fallback_history.append(item)
+        fallback_history.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(out),
+                    }
+                ],
+            }
+        )
+        session.agent_items = fallback_history[-16:]
+
+        session.history.append({
+            "user": user_message,
+            "agent": json.dumps(out),
+        })
+        if len(session.history) > 8:
+            session.history = session.history[-8:]
+        return out
+
+    serialized_history: List[Dict[str, Any]] = []
+    for item in result.to_input_list():
+        if isinstance(item, BaseModel):
+            serialized_history.append(item.model_dump(mode="json", exclude_none=True))
+        else:
+            serialized_history.append(item)
+    session.agent_items = serialized_history[-16:]
+
+    router_output = result.final_output_as(RouterOutputModel, raise_if_incorrect_type=True)
+    slots_obj = router_output.slots_as_dict()
+
+    session.history.append({
+        "user": user_message,
+        "agent": router_output.model_dump_json(),
+    })
+    if len(session.history) > 8:
+        session.history = session.history[-8:]
+
+    return {
+        "intent": router_output.intent,
+        "confidence": router_output.confidence,
+        "slots": json.dumps(slots_obj),
+        "slots_obj": slots_obj,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +566,74 @@ class MatchItem(BaseModel):
 
 MLS_SEARCH_DOMAINS = ["zillow.com", "redfin.com", "mlslistings.com"]
 
+MLS_WEB_SEARCH_TOOL = WebSearchTool(
+    filters=WebSearchToolFilters(
+        allowed_domains=[
+            "www.mls.com",
+            "www.zillow.com",
+            "www.redfin.com",
+            "www.mlslistings.com",
+        ],
+    ),
+    search_context_size="medium",
+    user_location=UserLocation(type="approximate"),
+)
+
+MLS_SEARCH_AGENT = Agent(
+    name="Search & Match",
+    instructions=prompts.mls_web_search_system_prompt(),
+    model="gpt-5",
+    tools=[MLS_WEB_SEARCH_TOOL],
+    output_type=MLSWebSearchResult,
+    model_settings=_default_reasoning_settings(),
+)
+
+def _agent_trace_context(workflow_name: str, agent_name: str):
+    current = get_current_trace()
+    if current:
+        return agent_span(agent_name, parent=current)
+    return trace(workflow_name)
+
+def _run_agent(agent: Agent[Any], agent_input: Union[str, List[Dict[str, Any]]]):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        result_queue: Queue[Tuple[bool, Any]] = Queue()
+
+        def _target() -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                run_result = new_loop.run_until_complete(
+                    Runner.run(agent, input=agent_input)
+                )
+                result_queue.put((True, run_result))
+            except Exception as exc:  # pragma: no cover - propagate back to caller
+                result_queue.put((False, exc))
+            finally:
+                try:
+                    new_loop.run_until_complete(new_loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                new_loop.close()
+                asyncio.set_event_loop(None)
+
+        thread = threading.Thread(target=_target, name=f"{agent.name}-runner", daemon=True)
+        thread.start()
+        thread.join()
+        try:
+            success, payload = result_queue.get_nowait()
+        except Empty as missing:
+            raise RuntimeError("Agent runner thread completed without returning a result") from missing
+        if success:
+            return payload
+        raise payload
+
+    return Runner.run_sync(agent, input=agent_input)
+
 
 def _estimate_monthly_payment(price: float, down_pct: float = 0.2, rate: float = 0.065, years: int = 30) -> float:
     loan = price * (1 - down_pct)
@@ -524,30 +756,37 @@ def _mls_search_live(criteria: Dict[str, Any]) -> Dict[str, Any]:
         f"Deal breakers: {criteria.get('deal_breakers') or 'unspecified'}",
     ]
     user_prompt = prompts.mls_web_search_user_prompt(MLS_SEARCH_DOMAINS, criteria_lines)
-
-    model_name = "gpt-4o-mini"
-    request_args: Dict[str, Any] = {
-        "model": model_name,
-        "input": [
-            {"role": "system", "content": prompts.mls_web_search_system_prompt()},
-            {"role": "user", "content": user_prompt},
-        ],
-        "tools": [{"type": "web_search"}],
-        "text": _schema_to_text_config(get_mls_web_search_schema()),
-    }
-    if _can_set_temperature(model_name, 0.2):
-        request_args["temperature"] = 0.2
-
-    resp = client.responses.create(**request_args)
-    raw_text = _response_output_text(resp)
     try:
-        parsed = _parse_json_from_text(raw_text)
-    except Exception as exc:
-        log.debug("Raw MLS search response text: %s", raw_text)
-        raise ValueError("Failed to parse MLS search JSON payload") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("MLS search response payload is not an object")
-    return parsed
+        with _agent_trace_context("Real Estate Search & Match", MLS_SEARCH_AGENT.name):
+            result = _run_agent(MLS_SEARCH_AGENT, user_prompt)
+        payload = result.final_output_as(MLSWebSearchResult, raise_if_incorrect_type=True)
+        return payload.model_dump(mode="json")
+    except Exception as exc:  # pragma: no cover - fallback path
+        log.exception("Search agent run failed; falling back to Responses API", exc_info=exc)
+
+        model_name = "gpt-4o-mini"
+        request_args: Dict[str, Any] = {
+            "model": model_name,
+            "input": [
+                {"role": "system", "content": prompts.mls_web_search_system_prompt()},
+                {"role": "user", "content": user_prompt},
+            ],
+            "tools": [{"type": "web_search"}],
+            "text": _schema_to_text_config(get_mls_web_search_schema()),
+        }
+        if _can_set_temperature(model_name, 0.2):
+            request_args["temperature"] = 0.2
+
+        resp = client.responses.create(**request_args)
+        raw_text = _response_output_text(resp)
+        try:
+            parsed = _parse_json_from_text(raw_text)
+        except Exception as inner_exc:
+            log.debug("Raw MLS search response text: %s", raw_text)
+            raise ValueError("Failed to parse MLS search JSON payload") from inner_exc
+        if not isinstance(parsed, dict):
+            raise ValueError("MLS search response payload is not an object")
+        return parsed
 
 
 def search_and_match(session: Session) -> List[MatchItem]:
@@ -1155,64 +1394,63 @@ mcp = FastMCP("RealEstate Workflow MCP")
 @mcp.tool
 def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     sid, session = _get_session(session_id)
-    guard = jailbreak_check(user_message)
-    if not guard.allowed:
+    with trace("Real Estate Workflow"):
+        guard = jailbreak_check(user_message)
+        if not guard.allowed:
+            return {
+                "session_id": sid,
+                "status": "blocked",
+                "reason": "Guardrails/Jailbreak check failed",
+                "details": guard.reasons,
+            }
+
+        routed = router_route(user_message, session)
+        intent = routed.get("intent", "general")
+
+        next_node = None
+        next_step_result = None
+
+        if intent == "buy":
+            next_node = "buyer_intake_step"
+            intake_result = intake_step(session, user_message, routed.get("slots_obj"))
+            next_step_result = {
+                "step": "buyer_intake_step",
+                "result": intake_result,
+                "intake_complete": intake_is_complete(session),
+            }
+        elif intent == "disclosures":
+            next_node = "disclosure_qa"
+            next_step_result = {
+                "step": "disclosure_qa",
+                "message": "Please provide the disclosure documents and your specific question.",
+            }
+        elif intent == "offer":
+            next_node = "offer_drafter"
+            next_step_result = {
+                "step": "offer_drafter",
+                "message": "Please provide property details to draft an offer.",
+            }
+        elif intent == "sell":
+            next_node = "general_sell_agent"
+            next_step_result = {
+                "step": "general_sell_agent",
+                "message": "Selling agent workflow - please provide property details.",
+            }
+        else:
+            next_node = "general"
+            next_step_result = {
+                "step": "general",
+                "message": "I can help you with buying, selling, or property disclosures. How can I assist you?",
+            }
+
         return {
             "session_id": sid,
-            "status": "blocked",
-            "reason": "Guardrails/Jailbreak check failed",
-            "details": guard.reasons,
+            "status": "ok",
+            "router": routed,
+            "slots_obj": routed.get("slots_obj", {}),
+            "next_node": next_node,
+            "next_step_result": next_step_result,
         }
-
-    routed = router_route(user_message, session)
-    intent = routed.get("intent", "general")
-
-    session.history.append({"user": user_message, "agent": f"intent={intent}"})
-
-    next_node = None
-    next_step_result = None
-
-    if intent == "buy":
-        next_node = "buyer_intake_step"
-        intake_result = intake_step(session, user_message, routed.get("slots_obj"))
-        next_step_result = {
-            "step": "buyer_intake_step",
-            "result": intake_result,
-            "intake_complete": intake_is_complete(session),
-        }
-    elif intent == "disclosures":
-        next_node = "disclosure_qa"
-        next_step_result = {
-            "step": "disclosure_qa",
-            "message": "Please provide the disclosure documents and your specific question.",
-        }
-    elif intent == "offer":
-        next_node = "offer_drafter"
-        next_step_result = {
-            "step": "offer_drafter",
-            "message": "Please provide property details to draft an offer.",
-        }
-    elif intent == "sell":
-        next_node = "general_sell_agent"
-        next_step_result = {
-            "step": "general_sell_agent",
-            "message": "Selling agent workflow - please provide property details.",
-        }
-    else:
-        next_node = "general"
-        next_step_result = {
-            "step": "general",
-            "message": "I can help you with buying, selling, or property disclosures. How can I assist you?",
-        }
-
-    return {
-        "session_id": sid,
-        "status": "ok",
-        "router": routed,
-        "slots_obj": routed.get("slots_obj", {}),
-        "next_node": next_node,
-        "next_step_result": next_step_result,
-    }
 
 
 @mcp.tool
