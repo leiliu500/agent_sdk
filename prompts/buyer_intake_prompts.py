@@ -13,6 +13,7 @@ _INTAKE_QUESTIONS: Dict[str, str] = {
     "timeline": "What is your timeline to move or purchase?",
     "must_haves": "What are your must-have features?",
     "deal_breakers": "Any deal-breakers we should avoid?",
+    "other_concerns": "Any other concerns we should be aware of?",
     "consents": "Do you consent to us storing and using your information to search for properties and contact you with matches? (yes/no)",
 }
 
