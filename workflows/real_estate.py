@@ -1965,7 +1965,7 @@ async def run_enhanced_workflow(workflow_input: WorkflowInput) -> Dict[str, Any]
 
 
 @mcp.tool
-def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+def run_workflow(user_message: str) -> Dict[str, Any]:
     """
     Main workflow orchestrator. Routes user messages through guardrails, intent detection,
     and appropriate sub-agents.
@@ -1977,7 +1977,7 @@ def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[st
     Returns:
         Dictionary containing workflow results, intent, and next steps
     """
-    workflow_input = WorkflowInput(input_as_text=user_message, session_id=session_id)
+    workflow_input = WorkflowInput(input_as_text=user_message)
     
     # Check if we're in an async context
     try:
@@ -2011,8 +2011,8 @@ def run_workflow(user_message: str, session_id: Optional[str] = None) -> Dict[st
 
 
 @mcp.tool
-def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[str] = None) -> Dict[str, Any]:
-    sid, session = _get_session(session_id)
+def buyer_intake_step(user_message: Optional[str] = None) -> Dict[str, Any]:
+    sid, session = _get_session(None)
     result = intake_step(session, user_message)
     done = intake_is_complete(session)
     next_node = None
@@ -2088,8 +2088,8 @@ def buyer_intake_step(session_id: Optional[str] = None, user_message: Optional[s
 
 
 @mcp.tool
-def search_and_match_tool(session_id: Optional[str] = None) -> Dict[str, Any]:
-    sid, session = _get_session(session_id)
+def search_and_match_tool() -> Dict[str, Any]:
+    sid, session = _get_session(None)
     if not intake_is_complete(session):
         return {
             "session_id": sid,
@@ -2145,9 +2145,8 @@ def tour_plan_tool(
     open_houses: Optional[List[Dict[str, Any]]] = None,
     preferred_windows: Optional[List[Dict[str, str]]] = None,
     user_message: Optional[str] = None,
-    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    sid, _ = _get_session(session_id)
+    sid, _ = _get_session(None)
 
     extracted: Dict[str, Any] = {"open_houses": [], "preferred_windows": []}
     if user_message and user_message.strip():
@@ -2233,10 +2232,9 @@ def health() -> Dict[str, Any]:
 
 
 @mcp.tool
-def reset_session(session_id: Optional[str] = None) -> Dict[str, Any]:
-    sid, _ = _get_session(session_id)
-    SESSIONS.pop(sid, None)
-    return {"status": "reset", "session_id": sid}
+def reset_session() -> Dict[str, Any]:
+    SESSIONS.clear()
+    return {"status": "reset"}
 
 
 __all__ = [

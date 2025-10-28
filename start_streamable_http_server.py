@@ -76,10 +76,6 @@ TOOL_SCHEMAS = {
             "user_message": {
                 "type": "string",
                 "description": "The user's message to process through the workflow"
-            },
-            "session_id": {
-                "type": "string",
-                "description": "Optional session ID to maintain conversation context"
             }
         },
         "required": ["user_message"]
@@ -87,10 +83,6 @@ TOOL_SCHEMAS = {
     "buyer_intake_step": {
         "type": "object",
         "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            },
             "user_message": {
                 "type": "string",
                 "description": "User's response to intake questions"
@@ -99,20 +91,11 @@ TOOL_SCHEMAS = {
     },
     "search_and_match_tool": {
         "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            }
-        }
+        "properties": {}
     },
     "tour_plan_tool": {
         "type": "object",
         "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            },
             "open_houses": {
                 "type": "array",
                 "description": "Open house options with availability",
@@ -154,10 +137,6 @@ TOOL_SCHEMAS = {
     "disclosure_qa_tool": {
         "type": "object",
         "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            },
             "user_question": {
                 "type": "string",
                 "description": "Question about property disclosures"
@@ -166,20 +145,11 @@ TOOL_SCHEMAS = {
     },
     "offer_drafter_tool": {
         "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            }
-        }
+        "properties": {}
     },
     "negotiation_coach_tool": {
         "type": "object",
         "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID"
-            },
             "user_input": {
                 "type": "string",
                 "description": "User's negotiation question or scenario"
@@ -192,12 +162,7 @@ TOOL_SCHEMAS = {
     },
     "reset_session": {
         "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "Session ID to reset"
-            }
-        }
+        "properties": {}
     }
 }
 
@@ -276,11 +241,8 @@ async def handle_message(request: Request):
     is_streamable_http = "application/json" in accept_header or "text/event-stream" in accept_header
     
     # For StreamableHttp, session can be in header or query param
-    session_id = (
-        request.headers.get("Mcp-Session-Id") or 
-        request.query_params.get("sessionId") or 
-        request.query_params.get("session_id")
-    )
+    # session_id is deprecated and ignored
+    session_id = None
     
     # Log incoming request for debugging
     print(f"\n{'='*60}")
@@ -296,35 +258,17 @@ async def handle_message(request: Request):
     method = body.get("method")
     
     # For StreamableHttp, we may not have a session yet (on first initialize)
-    if not session_id and is_streamable_http:
-        # Create a new session for StreamableHttp
-        session_id = str(uuid.uuid4())
-        sessions[session_id] = {"created": True, "initialized": False}
-        print(f"[DEBUG] Created new StreamableHttp session: {session_id}")
+    # No session_id creation for StreamableHttp
     
     # Don't fail on missing session for initialize - that's expected
-    if not session_id and method != "initialize":
-        print(f"[DEBUG] No session ID and not initialize request")
-        return JSONResponse({"error": "No session ID provided", "method": method}, status_code=400)
+    # No session_id required for any method
     
-    if session_id and session_id not in sessions and method != "initialize":
-        print(f"[DEBUG] Invalid session: {session_id}")
-        return JSONResponse({"error": "Invalid session", "sessionId": session_id}, status_code=400)
+    # No session_id validation
     
     # Optional: Validate session token if provided
     # The MCP Inspector might send a token, but it's not required for direct SSE connections
     session_token = request.headers.get("Authorization") or request.query_params.get("token")
-    if session_token:
-        token = session_token.replace("Bearer ", "").strip()
-        print(f"[DEBUG] Token provided: {token}")
-        # Only validate if we have tokens configured (for proxy mode)
-        if token and token not in session_tokens:
-            print(f"[DEBUG] Token not found in session_tokens")
-            # Don't fail - the Inspector might be sending its own token
-            # Just log it for debugging
-        elif token and session_tokens.get(token) != session_id:
-            print(f"[DEBUG] Token doesn't match session")
-            # Don't fail - allow the connection to proceed
+    # session_token is ignored
     
     # Body already read above
     msg_id = body.get("id")
@@ -336,49 +280,24 @@ async def handle_message(request: Request):
     
     # Handle initialize
     if method == "initialize":
-        # Ensure we're responding to the exact protocol version the client requested
         client_protocol = params.get("protocolVersion", "2024-11-05")
-        
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "protocolVersion": client_protocol,  # Echo back the client's version
-                "capabilities": {
-                    "tools": {},  # Empty object indicates tools are supported
-                    "logging": {}  # Empty object indicates logging is supported
-                },
-                "serverInfo": {
-                    "name": "real-estate-mcp",
-                    "version": "1.0.0"
-                }
+                "protocolVersion": client_protocol,
+                "capabilities": {"tools": {}, "logging": {}},
+                "serverInfo": {"name": "real-estate-mcp", "version": "1.0.0"}
             }
         }
         print(f"[DEBUG] Sending initialize response: {json.dumps(response, indent=2)}")
         print(f"[DEBUG] Client requested protocol version: {client_protocol}")
-        
-        # For StreamableHttp, include session ID in response header
-        response_headers = {"Content-Type": "application/json"}
-        if is_streamable_http:
-            response_headers["Mcp-Session-Id"] = session_id
-            print(f"[DEBUG] Adding Mcp-Session-Id header: {session_id}")
-        
-        return JSONResponse(
-            response,
-            status_code=200,
-            headers=response_headers
-        )
+        return JSONResponse(response, status_code=200, headers={"Content-Type": "application/json"})
     
     # Handle notifications/initialized (no response needed)
     if method == "notifications/initialized":
         print("[DEBUG] ✅ Received initialized notification - handshake complete!")
-        # Mark session as fully initialized
-        if session_id in sessions:
-            sessions[session_id]["initialized"] = True
-        # Notifications require 202 Accepted for StreamableHttp, or 200 OK for old SSE
-        status_code = 202 if is_streamable_http else 200
-        print(f"[DEBUG] Returning {status_code} (StreamableHttp={is_streamable_http})")
-        return JSONResponse({}, status_code=status_code)
+        return JSONResponse({}, status_code=202 if is_streamable_http else 200)
     
     # Handle ping
     if method == "ping":
@@ -422,9 +341,7 @@ async def handle_message(request: Request):
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
-        
         try:
-            # Get the tool function
             tool = TOOL_FUNCTIONS.get(tool_name)
             if not tool:
                 return JSONResponse({
@@ -435,11 +352,9 @@ async def handle_message(request: Request):
                         "message": f"Unknown tool: {tool_name}"
                     }
                 }, status_code=400)
-            
-            # Call the wrapped function
+            # Remove session_id from arguments if present
+            arguments.pop("session_id", None)
             result = tool.fn(**arguments)
-            
-            # Format response as JSON-RPC
             response = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -452,9 +367,7 @@ async def handle_message(request: Request):
                     ]
                 }
             }
-            
             return JSONResponse(response)
-            
         except Exception as e:
             import traceback
             error_response = {
@@ -735,6 +648,12 @@ async def root_endpoint_get(request: Request):
     )
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Start MCP server with Streamable HTTP transport (SSE fallback support)")
+    parser.add_argument('--ssl-keyfile', type=str, default=None, help='Path to SSL key file (PEM)')
+    parser.add_argument('--ssl-certfile', type=str, default=None, help='Path to SSL certificate file (PEM)')
+    args = parser.parse_args()
+
     print("Starting MCP server with StreamableHttp transport (SSE fallback) on http://localhost:8000")
     print("Endpoints:")
     print("  POST /               - StreamableHttp MCP endpoint (primary)")
@@ -745,4 +664,9 @@ if __name__ == "__main__":
     print("\nConnect with:")
     print("  npx @modelcontextprotocol/inspector http://127.0.0.1:8000")
     print("\nPress Ctrl+C to stop\n")
-    uvicorn.run(app, host="0.0.0.0", port=7000)
+
+    uvicorn_kwargs = dict(app=app, host="0.0.0.0", port=7000)
+    if args.ssl_keyfile and args.ssl_certfile:
+        uvicorn_kwargs['ssl_keyfile'] = args.ssl_keyfile
+        uvicorn_kwargs['ssl_certfile'] = args.ssl_certfile
+    uvicorn.run(**uvicorn_kwargs)
