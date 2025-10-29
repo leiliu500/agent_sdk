@@ -2078,13 +2078,26 @@ def buyer_intake_step(user_message: Optional[str] = None, session_id: str = None
         else:
             next_node = "search_and_match"
 
-    return {
+    # For n8n: add a top-level search_and_match_results if available
+    search_and_match_results = None
+    if next_step_result and next_step_result.get("step") == "search_and_match":
+        search_and_match_results = {
+            "matches": next_step_result.get("matches"),
+            "open_houses": next_step_result.get("open_houses"),
+            "count": next_step_result.get("count"),
+            "message": next_step_result.get("message"),
+        }
+
+    response = {
         "session_id": sid,
         "result": result,
         "intake_complete": done,
         "next_node": next_node,
         "next_step_result": next_step_result,
     }
+    if search_and_match_results is not None:
+        response["search_and_match_results"] = search_and_match_results
+    return response
 
 
 @mcp.tool
