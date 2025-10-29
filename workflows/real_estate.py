@@ -1965,7 +1965,7 @@ async def run_enhanced_workflow(workflow_input: WorkflowInput) -> Dict[str, Any]
 
 
 @mcp.tool
-def run_workflow(user_message: str) -> Dict[str, Any]:
+def run_workflow(user_message: str, session_id: str = None) -> Dict[str, Any]:
     """
     Main workflow orchestrator. Routes user messages through guardrails, intent detection,
     and appropriate sub-agents.
@@ -1977,7 +1977,7 @@ def run_workflow(user_message: str) -> Dict[str, Any]:
     Returns:
         Dictionary containing workflow results, intent, and next steps
     """
-    workflow_input = WorkflowInput(input_as_text=user_message)
+    workflow_input = WorkflowInput(input_as_text=user_message, session_id=session_id)
     
     # Check if we're in an async context
     try:
@@ -2011,8 +2011,8 @@ def run_workflow(user_message: str) -> Dict[str, Any]:
 
 
 @mcp.tool
-def buyer_intake_step(user_message: Optional[str] = None) -> Dict[str, Any]:
-    sid, session = _get_session(None)
+def buyer_intake_step(user_message: Optional[str] = None, session_id: str = None) -> Dict[str, Any]:
+    sid, session = _get_session(session_id)
     result = intake_step(session, user_message)
     done = intake_is_complete(session)
     next_node = None
@@ -2088,8 +2088,8 @@ def buyer_intake_step(user_message: Optional[str] = None) -> Dict[str, Any]:
 
 
 @mcp.tool
-def search_and_match_tool() -> Dict[str, Any]:
-    sid, session = _get_session(None)
+def search_and_match_tool(session_id: str = None) -> Dict[str, Any]:
+    sid, session = _get_session(session_id)
     if not intake_is_complete(session):
         return {
             "session_id": sid,
@@ -2145,8 +2145,9 @@ def tour_plan_tool(
     open_houses: Optional[List[Dict[str, Any]]] = None,
     preferred_windows: Optional[List[Dict[str, str]]] = None,
     user_message: Optional[str] = None,
+    session_id: str = None,
 ) -> Dict[str, Any]:
-    sid, _ = _get_session(None)
+    sid, _ = _get_session(session_id)
 
     extracted: Dict[str, Any] = {"open_houses": [], "preferred_windows": []}
     if user_message and user_message.strip():
@@ -2203,13 +2204,13 @@ def tour_plan_tool(
 
 
 @mcp.tool
-def disclosure_qa_tool(question: str, files: List[Dict[str, str]]) -> Dict[str, Any]:
+def disclosure_qa_tool(question: str, files: List[Dict[str, str]], session_id: str = None) -> Dict[str, Any]:
     qa_files = [QAFile(**file_info) for file_info in files]
     return disclosure_qa(qa_files, question)
 
 
 @mcp.tool
-def offer_drafter_tool(prompt_context: str) -> Dict[str, Any]:
+def offer_drafter_tool(prompt_context: str, session_id: str = None) -> Dict[str, Any]:
     return llm_json(
         system_prompt=prompts.offer_drafter_system_prompt(),
         user_prompt=prompt_context,
@@ -2218,7 +2219,7 @@ def offer_drafter_tool(prompt_context: str) -> Dict[str, Any]:
 
 
 @mcp.tool
-def negotiation_coach_tool(prompt_context: str) -> Dict[str, Any]:
+def negotiation_coach_tool(prompt_context: str, session_id: str = None) -> Dict[str, Any]:
     return llm_json(
         system_prompt=prompts.negotiation_coach_system_prompt(),
         user_prompt=prompt_context,
@@ -2227,12 +2228,12 @@ def negotiation_coach_tool(prompt_context: str) -> Dict[str, Any]:
 
 
 @mcp.tool
-def health() -> Dict[str, Any]:
+def health(session_id: str = None) -> Dict[str, Any]:
     return {"status": "ok", "sessions": len(SESSIONS)}
 
 
 @mcp.tool
-def reset_session() -> Dict[str, Any]:
+def reset_session(session_id: str = None) -> Dict[str, Any]:
     SESSIONS.clear()
     return {"status": "reset"}
 

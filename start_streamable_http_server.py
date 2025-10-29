@@ -427,12 +427,13 @@ async def root_endpoint(request: Request):
             # Track by IP address (not IP:port since port changes)
             last_session_by_ip[client_ip] = session_id
             client_sessions[client_key] = session_id  # Also track specific connection
+            print(f"[INFO] Generated new session_id: {session_id} for client IP: {client_ip} (returned in response header)")
             print(f"[DEBUG] Created new session for initialize: {session_id}")
             print(f"[DEBUG] Mapped client IP {client_ip} -> session {session_id}")
-        
+
         # Ensure we're responding to the exact protocol version the client requested
         client_protocol = params.get("protocolVersion", "2024-11-05")
-        
+
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -449,7 +450,7 @@ async def root_endpoint(request: Request):
             }
         }
         print(f"[DEBUG] Sending initialize response with session: {session_id}")
-        
+
         return JSONResponse(
             response,
             status_code=200,
@@ -551,10 +552,15 @@ async def root_endpoint(request: Request):
                         "message": f"Unknown tool: {tool_name}"
                     }
                 }, status_code=400)
-            
-            # Call the wrapped function
+
+            # Pass session_id to tool if it accepts it
+            import inspect
+            sig = inspect.signature(tool.fn)
+            if "session_id" in sig.parameters:
+                arguments = dict(arguments)  # copy to avoid mutating original
+                arguments["session_id"] = session_id
             result = tool.fn(**arguments)
-            
+
             # Format response as JSON-RPC
             response = {
                 "jsonrpc": "2.0",
@@ -568,9 +574,9 @@ async def root_endpoint(request: Request):
                     ]
                 }
             }
-            
+
             return JSONResponse(response)
-            
+
         except Exception as e:
             import traceback
             error_response = {
